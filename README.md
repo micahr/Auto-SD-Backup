@@ -106,6 +106,44 @@ cp config.yaml.example config.yaml
 cp .env.example .env
 ```
 
+### macOS Development Setup
+
+For development and testing on macOS:
+
+1. **Install dependencies**:
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+Note: `pyudev` won't install on macOS (Linux-only), this is expected.
+
+2. **Configure for development**:
+```bash
+cp config.yaml.example config.yaml
+cp .env.example .env
+```
+
+Edit `config.yaml` to disable services you don't have (Immich/Unraid/MQTT) or set up local testing:
+```yaml
+sd_card:
+  detection_mode: dev  # or "macos" to monitor /Volumes
+
+unraid:
+  enabled: true
+  protocol: local  # Use local filesystem for testing
+  path: "~/snapsync-backups"
+```
+
+3. **Run manual backups**:
+```bash
+# Backup any directory
+python snapsync.py backup ~/Pictures/test-photos
+```
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for detailed macOS development instructions.
+
 ## Configuration
 
 ### Main Configuration File (`config.yaml`)
@@ -357,6 +395,12 @@ Starts only the web UI without the backup service (useful for testing).
 snapsync --help
 ```
 
+### Manual Backup (Development/Testing)
+```bash
+snapsync backup /path/to/directory
+```
+Manually trigger a backup for any directory without waiting for SD card insertion. Perfect for testing and development.
+
 ## Architecture
 
 ### Components
@@ -572,6 +616,36 @@ source venv/bin/activate
 
 # Run in development mode
 python snapsync.py start
+```
+
+### Development on macOS
+
+SnapSync is fully compatible with macOS for development:
+
+- **Auto-detection**: Automatically monitors `/Volumes` for new drives
+- **Manual triggering**: Use `snapsync backup <path>` to test any directory
+- **Local testing**: Set `protocol: local` to backup to local directories
+- **No Docker required**: Runs natively on macOS
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for complete macOS setup instructions.
+
+**Quick Start (macOS)**:
+```bash
+# Clone and setup
+git clone https://github.com/yourusername/snapsync.git
+cd snapsync
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# Configure
+cp config.yaml.example config.yaml
+# Edit config.yaml, set detection_mode: dev and disable services you don't have
+
+# Test with a directory
+mkdir -p ~/test-photos
+cp ~/Pictures/*.jpg ~/test-photos/
+python snapsync.py backup ~/test-photos
 ```
 
 ### Contributing

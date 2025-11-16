@@ -239,6 +239,96 @@ def web(ctx):
     )
 
 
+@cli.command()
+@click.argument('path')
+@click.pass_context
+def backup(ctx, path):
+    """Manually trigger backup for a specific directory"""
+    config_path = ctx.obj['config_path']
+
+    async def run_backup():
+        config = Config.from_file(config_path)
+
+        if not config.validate():
+            click.echo("Configuration validation failed.", err=True)
+            return
+
+        from .service import ServiceManager
+
+        service = ServiceManager(config)
+
+        # Initialize only what we need
+        await service.database.initialize()
+
+        if config.immich.enabled:
+            from .immich_client import ImmichClient
+            service.immich_client = ImmichClient(
+                config.immich.url,
+                config.immich.api_key,
+                config.immich.timeout
+            )
+            await service.immich_client.initialize()
+
+        if config.unraid.enabled:
+            from .unraid_client import UnraidClient
+            service.unraid_client = UnraidClient(
+                config.unraid.host,
+                config.unraid.share,
+                config.unraid.path,
+                config.unraid.username,
+                config.unraid.password,
+                config.unraid.protocol
+            )
+            await service.unraid_client.initialize()
+
+        from .backup_engine import BackupEngine
+        service.backup_engine = BackupEngine(
+            config,
+            service.database,
+            service.immich_client,
+            service.unraid_client
+        )
+
+        click.echo(f"\nStarting backup for: {path}\n")
+
+        try:
+            session_id = await service.trigger_backup(path)
+            click.echo(f"Backup started with session ID: {session_id}")
+
+            # Wait for backup to complete
+            while True:
+                session = await service.database.get_session(session_id)
+                if session['status'] in ['completed', 'completed_with_errors', 'failed']:
+                    break
+
+                click.echo(
+                    f"Progress: {session['completed_files']}/{session['total_files']} files "
+                    f"({session['failed_files']} failed)"
+                )
+                await asyncio.sleep(2)
+
+            # Final status
+            session = await service.database.get_session(session_id)
+            click.echo(f"\n=== Backup Complete ===")
+            click.echo(f"Status: {session['status']}")
+            click.echo(f"Total files: {session['total_files']}")
+            click.echo(f"Completed: {session['completed_files']}")
+            click.echo(f"Failed: {session['failed_files']}")
+            click.echo(f"Bytes transferred: {session['transferred_bytes']}")
+
+        except Exception as e:
+            click.echo(f"Error: {e}", err=True)
+        finally:
+            # Cleanup
+            if service.immich_client:
+                await service.immich_client.close()
+            if service.unraid_client:
+                await service.unraid_client.close()
+            await service.database.close()
+
+    asyncio.run(run_backup())
+
+
 def main():
     """Entry point for the CLI"""
     cli(obj={})

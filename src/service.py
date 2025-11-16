@@ -7,7 +7,7 @@ import uvicorn
 
 from .config import Config
 from .database import BackupDatabase
-from .sd_detector import SDCardDetector, SDCard
+from .sd_detector_cross_platform import create_detector, SDCard
 from .immich_client import ImmichClient
 from .unraid_client import UnraidClient
 from .backup_engine import BackupEngine
@@ -88,10 +88,12 @@ class ServiceManager:
                 progress_callback=self._on_backup_progress
             )
 
-            # Initialize SD card detector
-            self.sd_detector = SDCardDetector(
+            # Initialize SD card detector (auto-detects platform)
+            detection_mode = getattr(self.config.sd_card, 'detection_mode', 'auto')
+            self.sd_detector = create_detector(
                 on_insert=self._on_sd_card_inserted,
-                on_remove=self._on_sd_card_removed
+                on_remove=self._on_sd_card_removed,
+                mode=detection_mode
             )
 
             # Start web server in background
@@ -253,3 +255,34 @@ class ServiceManager:
             "unraid_enabled": self.config.unraid.enabled,
             "mqtt_enabled": self.config.mqtt.enabled
         }
+
+    async def trigger_backup(self, path: str) -> str:
+        """
+        Manually trigger a backup for a specific directory
+
+        Args:
+            path: Path to directory to backup
+
+        Returns:
+            Session ID
+        """
+        from pathlib import Path
+        path_obj = Path(path)
+
+        if not path_obj.exists():
+            raise ValueError(f"Path does not exist: {path}")
+
+        if not path_obj.is_dir():
+            raise ValueError(f"Path is not a directory: {path}")
+
+        # Create a simulated SD card
+        sd_card = SDCard(
+            device_name=path_obj.name,
+            mount_point=str(path_obj),
+            device_path=str(path_obj),
+            size=0,
+            label=path_obj.name
+        )
+
+        logger.info(f"Manually triggered backup for: {path}")
+        return await self.backup_engine.start_backup(sd_card)

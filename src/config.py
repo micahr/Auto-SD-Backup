@@ -23,6 +23,7 @@ class SDCardConfig:
     """SD Card detection configuration"""
     auto_detect: bool = True
     mount_points: list = field(default_factory=list)
+    detection_mode: str = "auto"  # auto, linux, macos, dev
 
 
 @dataclass

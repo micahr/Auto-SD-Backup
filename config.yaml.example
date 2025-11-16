@@ -13,6 +13,12 @@ sd_card:
   auto_detect: true
   # Optional: specific mount points to monitor
   mount_points: []
+  # Detection mode: auto (platform-specific), linux, macos, dev
+  # auto = automatically choose based on OS
+  # linux = use pyudev for USB detection
+  # macos = monitor /Volumes directory
+  # dev = manual triggering only (for development)
+  detection_mode: auto
 
 # File filtering
 files:
