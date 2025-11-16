@@ -1,0 +1,103 @@
+# SD Card Backup Service Configuration
+
+# Service settings
+service:
+  name: "SD Card Backup Service"
+  database_path: "./backup.db"
+  log_level: "INFO"
+  web_ui_port: 8080
+
+# SD Card detection
+sd_card:
+  # Auto-detect removable media
+  auto_detect: true
+  # Optional: specific mount points to monitor
+  mount_points: []
+  # Detection mode: auto (platform-specific), linux, macos, dev
+  # auto = automatically choose based on OS
+  # linux = use pyudev for USB detection
+  # macos = monitor /Volumes directory
+  # dev = manual triggering only (for development)
+  detection_mode: auto
+
+# File filtering
+files:
+  # File extensions to backup (case-insensitive)
+  extensions:
+    - .jpg
+    - .jpeg
+    - .png
+    - .raw
+    - .cr2
+    - .cr3
+    - .nef
+    - .arw
+    - .dng
+    - .orf
+    - .rw2
+    - .pef
+    - .srw
+    - .mp4
+    - .mov
+    - .avi
+    - .mkv
+    - .mts
+  # Minimum file size in bytes (to skip tiny files)
+  min_size: 1024
+
+# Immich configuration
+immich:
+  enabled: true
+  url: "http://your-immich-server:2283"
+  api_key: "your-api-key-here"
+  # Upload timeout in seconds
+  timeout: 300
+  # Organize by date in Immich albums
+  organize_by_date: true
+
+# Unraid/Network Storage configuration
+unraid:
+  enabled: true
+  protocol: "smb"  # smb, nfs, or local
+  # For SMB
+  host: "unraid-server"
+  share: "backups"
+  path: "camera-backups"
+  username: "your-username"
+  password: "your-password"
+  # For local or NFS
+  # mount_point: "/mnt/unraid/backups"
+  # Organize by date in folder structure
+  organize_by_date: true
+
+# MQTT / Home Assistant integration
+mqtt:
+  enabled: true
+  broker: "homeassistant.local"
+  port: 1883
+  username: ""
+  password: ""
+  # Discovery topic for Home Assistant auto-discovery
+  discovery_prefix: "homeassistant"
+  # Device topic
+  topic_prefix: "sd-backup"
+  # Client ID
+  client_id: "sd-backup-service"
+
+# Backup behavior
+backup:
+  # Run backups in parallel (Immich + Unraid simultaneously)
+  parallel: true
+  # Number of files to process concurrently
+  concurrent_files: 3
+  # Verify checksums after upload
+  verify_checksums: true
+  # Retry failed uploads
+  max_retries: 3
+  retry_delay: 5
+  # Require manual approval before starting backup (useful for laptops)
+  # When enabled, SD card insertions will wait for approval via web UI or MQTT
+  require_approval: false
+  # Auto-backup enabled by default (can be toggled via web UI or MQTT)
+  # This is a runtime toggle - set to false to start with auto-backup disabled
+  auto_backup_enabled: true
