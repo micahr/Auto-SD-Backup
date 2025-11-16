@@ -1,0 +1,15 @@
+# Testing dependencies for SnapSync
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-mock==3.12.0
+pytest-cov==4.1.0
+pytest-timeout==2.2.0
+
+# For mocking HTTP requests
+respx==0.20.2
+
+# For temporary directories and file handling
+pytest-tmp-files==0.0.2
+
+# For freezing time in tests
+freezegun==1.4.0
