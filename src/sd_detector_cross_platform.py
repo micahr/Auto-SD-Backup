@@ -161,7 +161,7 @@ class LinuxSDCardDetector:
 
 
 class MacOSSDCardDetector:
-    """macOS SD card detector using /Volumes directory monitoring"""
+    """macOS SD card detector using /Volumes directory monitoring and diskutil"""
 
     def __init__(self, on_insert: Optional[Callable] = None, on_remove: Optional[Callable] = None):
         self.on_insert = on_insert
@@ -175,20 +175,22 @@ class MacOSSDCardDetector:
     async def start(self):
         """Start monitoring /Volumes for new mounts"""
         self._running = True
-        logger.info("macOS SD card detector started (monitoring /Volumes)")
+        logger.info("macOS SD card detector started")
+        logger.info("Monitoring: /Volumes directory and diskutil for removable media")
+        logger.info("This includes built-in SD card readers and external USB drives")
 
         # Get initial volumes
-        self._known_volumes = set(self._get_volumes())
-        logger.info(f"Initial volumes: {self._known_volumes}")
+        self._known_volumes = set(self._get_removable_volumes())
+        logger.info(f"Initial removable volumes: {self._known_volumes}")
 
         # Start monitoring
         while self._running:
-            await asyncio.sleep(2)  # Check every 2 seconds
+            await asyncio.sleep(1)  # Check every second for faster detection
             await self._check_volumes()
 
     async def _check_volumes(self):
         """Check for new or removed volumes"""
-        current_volumes = set(self._get_volumes())
+        current_volumes = set(self._get_removable_volumes())
 
         # Check for new volumes
         new_volumes = current_volumes - self._known_volumes
@@ -204,8 +206,49 @@ class MacOSSDCardDetector:
 
         self._known_volumes = current_volumes
 
-    def _get_volumes(self) -> List[str]:
-        """Get list of mounted volumes"""
+    def _get_removable_volumes(self) -> List[str]:
+        """Get list of removable volumes using diskutil"""
+        removable_volumes = []
+
+        try:
+            import subprocess
+
+            # Use diskutil to list all external/removable disks
+            result = subprocess.run(
+                ['diskutil', 'list', '-plist', 'external'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+
+            if result.returncode == 0:
+                # Parse diskutil output to find removable volumes
+                import plistlib
+                plist_data = plistlib.loads(result.stdout.encode())
+
+                for disk in plist_data.get('AllDisksAndPartitions', []):
+                    # Check partitions for mount points
+                    for partition in disk.get('Partitions', []):
+                        mount_point = partition.get('MountPoint', '')
+                        if mount_point and mount_point.startswith('/Volumes/'):
+                            volume_name = mount_point.replace('/Volumes/', '')
+                            if volume_name:
+                                removable_volumes.append(volume_name)
+                                logger.debug(f"Found removable volume via diskutil: {volume_name}")
+
+        except Exception as e:
+            logger.debug(f"diskutil detection failed, falling back to directory listing: {e}")
+            # Fallback to directory listing if diskutil fails
+            return self._get_volumes_fallback()
+
+        # If diskutil didn't find anything, use fallback method
+        if not removable_volumes:
+            return self._get_volumes_fallback()
+
+        return removable_volumes
+
+    def _get_volumes_fallback(self) -> List[str]:
+        """Fallback method: Get volumes by listing /Volumes directory"""
         if not self._volumes_path.exists():
             return []
 
@@ -215,13 +258,15 @@ class MacOSSDCardDetector:
             if item.name not in ['Macintosh HD', 'Preboot', 'Recovery', 'VM', 'Data']:
                 if item.is_dir():
                     volumes.append(item.name)
+                    logger.debug(f"Found volume via directory listing: {item.name}")
         return volumes
 
     async def _handle_volume_added(self, volume_name: str, volume_path: Path):
         """Handle new volume detected"""
         try:
-            # Get volume size
+            # Get volume size and info
             size = self._get_volume_size(volume_path)
+            disk_info = self._get_disk_info(volume_name)
 
             sd_card = SDCard(
                 device_name=volume_name,
@@ -232,7 +277,14 @@ class MacOSSDCardDetector:
             )
 
             self._mounted_cards[volume_name] = sd_card
-            logger.info(f"Volume detected: {volume_name} at {volume_path}")
+
+            # Enhanced logging
+            logger.info(f"✓ Removable volume detected: '{volume_name}'")
+            logger.info(f"  Mount point: {volume_path}")
+            if disk_info:
+                logger.info(f"  Type: {disk_info}")
+            if size > 0:
+                logger.info(f"  Size: {self._format_size(size)}")
 
             if self.on_insert:
                 await self.on_insert(sd_card)
@@ -244,7 +296,7 @@ class MacOSSDCardDetector:
         """Handle volume removed"""
         if volume_name in self._mounted_cards:
             sd_card = self._mounted_cards.pop(volume_name)
-            logger.info(f"Volume removed: {volume_name}")
+            logger.info(f"✗ Volume removed: '{volume_name}'")
 
             if self.on_remove:
                 await self.on_remove(sd_card)
@@ -266,6 +318,35 @@ class MacOSSDCardDetector:
         except:
             pass
         return 0
+
+    def _get_disk_info(self, volume_name: str) -> Optional[str]:
+        """Get disk type info using diskutil"""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['diskutil', 'info', f'/Volumes/{volume_name}'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                # Look for "Protocol:" line to identify the connection type
+                for line in result.stdout.split('\n'):
+                    if 'Protocol:' in line:
+                        return line.split(':', 1)[1].strip()
+                    elif 'Device / Media Name:' in line:
+                        return line.split(':', 1)[1].strip()
+        except:
+            pass
+        return None
+
+    def _format_size(self, size_bytes: int) -> str:
+        """Format bytes to human readable size"""
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if size_bytes < 1024.0:
+                return f"{size_bytes:.1f} {unit}"
+            size_bytes /= 1024.0
+        return f"{size_bytes:.1f} PB"
 
     async def stop(self):
         """Stop monitoring"""

@@ -85,10 +85,14 @@ Automatically selects the appropriate detector:
 sd_card:
   detection_mode: macos
 ```
-Monitors `/Volumes` directory for new mounts:
-- Insert SD card → automatically detected
-- Works with USB drives, SD cards, external drives
+Monitors `/Volumes` directory and uses `diskutil` for removable media detection:
+- **Works with built-in SD card readers** (MacBook Pro/Air built-in slots)
+- Works with external USB card readers
+- Works with USB drives, external drives
+- Uses `diskutil list external` to identify removable media
+- Polls every 1 second for fast detection
 - Excludes system volumes (Macintosh HD, etc.)
+- Shows device type (SD Card Reader, USB, etc.) in logs
 
 ### 3. Dev Mode (Manual Triggering)
 ```yaml
@@ -217,21 +221,54 @@ python snapsync.py web
 
 When using `detection_mode: macos`, SnapSync will:
 
-1. Monitor `/Volumes` every 2 seconds
-2. Detect new volumes (excluding system volumes)
-3. Automatically trigger backup when new volume appears
-4. Track removals
+1. Use `diskutil list external` to detect removable media
+2. Monitor `/Volumes` every 1 second (fast detection)
+3. Detect new volumes (excluding system volumes)
+4. Automatically trigger backup when new volume appears
+5. Track removals
+6. Show device type in logs (SD Card, USB, etc.)
+
+**Supported on macOS:**
+- ✅ Built-in SD card readers (MacBook Pro/Air SDXC slots)
+- ✅ External USB SD card readers
+- ✅ USB flash drives
+- ✅ External hard drives
+- ✅ Any removable media that mounts to /Volumes
 
 ### Testing Volume Detection
+
+**With built-in SD card reader:**
 ```bash
 # Start service
 python snapsync.py start
 
-# In another terminal, insert SD card or USB drive
-# Watch the logs for detection
+# Insert SD card into built-in slot
+# Watch the logs - you should see:
+# ✓ Removable volume detected: 'NO NAME'
+#   Mount point: /Volumes/NO NAME
+#   Type: SD Card Reader
+#   Size: 32.0 GB
+```
 
-# Or mount a disk image for testing
-hdiutil attach /path/to/test.dmg
+**With external USB reader:**
+```bash
+# Start service with debug logging
+# Edit config.yaml: log_level: "DEBUG"
+python snapsync.py start
+
+# Insert SD card
+# Watch detailed logs showing diskutil detection
+```
+
+**Testing with disk image:**
+```bash
+# Create test disk image
+hdiutil create -size 100m -fs HFS+ -volname "TestSD" test.dmg
+
+# Mount it
+hdiutil attach test.dmg
+
+# Should be detected as removable media
 ```
 
 ## Debugging
