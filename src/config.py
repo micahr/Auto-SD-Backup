@@ -175,6 +175,94 @@ class Config:
             if password := os.getenv('MQTT_PASSWORD'):
                 data['mqtt']['password'] = password
 
+    @staticmethod
+    def save_env_vars(updates: Dict[str, str]):
+        """Save environment variables to .env file"""
+        env_file = Path('.env')
+        env_vars = {}
+
+        # Read existing .env file if it exists
+        if env_file.exists():
+            with open(env_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        key, _, value = line.partition('=')
+                        env_vars[key.strip()] = value.strip()
+
+        # Update with new values
+        env_vars.update(updates)
+
+        # Write back to .env file
+        with open(env_file, 'w') as f:
+            for key, value in env_vars.items():
+                f.write(f"{key}={value}\n")
+
+        # Update os.environ as well
+        os.environ.update(updates)
+
+        logger.info(f"Environment variables updated: {', '.join(updates.keys())}")
+
+    def to_yaml(self, config_path: str):
+        """Save configuration to YAML file (excluding sensitive data)"""
+        config_data = {
+            'service': {
+                'name': self.service.name,
+                'database_path': self.service.database_path,
+                'log_level': self.service.log_level,
+                'web_ui_port': self.service.web_ui_port,
+            },
+            'sd_card': {
+                'auto_detect': self.sd_card.auto_detect,
+                'mount_points': self.sd_card.mount_points,
+                'detection_mode': self.sd_card.detection_mode,
+            },
+            'files': {
+                'extensions': self.files.extensions,
+                'min_size': self.files.min_size,
+            },
+            'immich': {
+                'enabled': self.immich.enabled,
+                'url': self.immich.url,
+                # api_key is stored in .env
+                'timeout': self.immich.timeout,
+                'organize_by_date': self.immich.organize_by_date,
+            },
+            'unraid': {
+                'enabled': self.unraid.enabled,
+                'protocol': self.unraid.protocol,
+                'host': self.unraid.host,
+                'share': self.unraid.share,
+                'path': self.unraid.path,
+                # username and password are stored in .env
+                'mount_point': self.unraid.mount_point,
+                'organize_by_date': self.unraid.organize_by_date,
+            },
+            'mqtt': {
+                'enabled': self.mqtt.enabled,
+                'broker': self.mqtt.broker,
+                'port': self.mqtt.port,
+                # username and password are stored in .env
+                'discovery_prefix': self.mqtt.discovery_prefix,
+                'topic_prefix': self.mqtt.topic_prefix,
+                'client_id': self.mqtt.client_id,
+            },
+            'backup': {
+                'parallel': self.backup.parallel,
+                'concurrent_files': self.backup.concurrent_files,
+                'verify_checksums': self.backup.verify_checksums,
+                'max_retries': self.backup.max_retries,
+                'retry_delay': self.backup.retry_delay,
+                'require_approval': self.backup.require_approval,
+                'auto_backup_enabled': self.backup.auto_backup_enabled,
+            }
+        }
+
+        with open(config_path, 'w') as f:
+            yaml.dump(config_data, f, default_flow_style=False, sort_keys=False)
+
+        logger.info(f"Configuration saved to {config_path}")
+
     def validate(self) -> bool:
         """Validate configuration"""
         errors = []
