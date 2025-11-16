@@ -7,12 +7,13 @@ SnapSync is a Python-based service that automatically detects SD cards when inse
 ## Features
 
 - **Automatic SD Card Detection**: Monitors for SD card insertion and starts backup immediately
+- **Manual Approval Mode**: Optional approval workflow for laptops - approve backups via web UI or MQTT
 - **Parallel Uploads**: Uploads to Immich and Unraid simultaneously for faster backups
 - **Smart Deduplication**: Tracks files via MD5 hash to avoid backing up the same file twice
 - **Checksum Verification**: Verifies file integrity after upload with MD5 checksums
 - **Date-Based Organization**: Organizes files by date (YYYY/MM/DD) on both destinations
 - **Home Assistant Integration**: MQTT integration with auto-discovery for status monitoring
-- **Web Dashboard**: Beautiful web UI for monitoring backups and viewing history
+- **Web Dashboard**: Beautiful web UI for monitoring backups, viewing history, and managing approvals
 - **CLI Tools**: Command-line interface for status checks and manual operations
 - **Configurable File Filters**: Support for common camera file formats (JPG, RAW, videos)
 - **Resilient**: Automatic retry on failures, resume interrupted backups
@@ -24,6 +25,7 @@ SnapSync is a Python-based service that automatically detects SD cards when inse
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Configuration](#configuration)
+- [Backup Approval Workflow](#backup-approval-workflow)
 - [Usage](#usage)
 - [Home Assistant Integration](#home-assistant-integration)
 - [Web UI](#web-ui)
@@ -210,6 +212,8 @@ backup:
   verify_checksums: true  # Verify file integrity after upload
   max_retries: 3
   retry_delay: 5  # Seconds
+  require_approval: false  # Require manual approval before backup (useful for laptops)
+  auto_backup_enabled: true  # Auto-backup toggle (can be changed via UI/MQTT)
 ```
 
 ### Environment Variables (`.env`)
@@ -244,6 +248,126 @@ For Unraid or any SMB share:
 For NFS or local mounts:
 - Set `protocol: "nfs"` or `protocol: "local"`
 - Set `mount_point` to the mounted path
+
+## Backup Approval Workflow
+
+SnapSync supports an optional approval workflow, perfect for laptops or situations where you want manual control over when backups start.
+
+### How It Works
+
+When `require_approval: true` is set in your configuration:
+
+1. **SD Card Detected**: When you insert an SD card, SnapSync detects it but waits for approval
+2. **Pending State**: The backup is added to a pending queue
+3. **Approval Required**: You can approve or reject the backup via:
+   - **Web UI**: Toggle and approve/reject buttons in the dashboard
+   - **MQTT**: Send commands via Home Assistant or MQTT client
+4. **Auto-Backup Toggle**: You can also enable/disable auto-backup entirely without changing the config
+
+### Configuration
+
+```yaml
+backup:
+  require_approval: false  # Set to true to enable approval workflow
+  auto_backup_enabled: true  # Can be toggled at runtime
+```
+
+**Recommended Settings:**
+- **Raspberry Pi / Dedicated Server**: `require_approval: false` - Automatic backups
+- **MacBook / Laptop**: `require_approval: true` - Manual approval for each backup
+
+### Web UI Controls
+
+The web dashboard provides two control mechanisms:
+
+1. **Auto-Backup Toggle**: Enable/disable automatic backups
+   - When disabled, SnapSync ignores all SD card insertions
+   - When enabled, follows the `require_approval` setting
+
+2. **Pending Approvals**: When approval is required
+   - Pending backups appear in a highlighted section
+   - Click **Approve** to start the backup
+   - Click **Reject** to dismiss the backup
+
+### MQTT Commands
+
+Control backups via MQTT by publishing to `snapsync/command`:
+
+**Enable/Disable Auto-Backup:**
+```bash
+# Enable auto-backup
+mosquitto_pub -h homeassistant.local -t "snapsync/command" -m "auto_backup_enable"
+
+# Disable auto-backup
+mosquitto_pub -h homeassistant.local -t "snapsync/command" -m "auto_backup_disable"
+```
+
+**Approve/Reject Pending Backups:**
+```bash
+# Approve a backup (backup_id shown in web UI or MQTT message)
+mosquitto_pub -h homeassistant.local -t "snapsync/command" -m "approve_pending_SD_CARD_12345"
+
+# Reject a backup
+mosquitto_pub -h homeassistant.local -t "snapsync/command" -m "reject_pending_SD_CARD_12345"
+```
+
+### Home Assistant Integration
+
+Create automations or buttons in Home Assistant to control backups:
+
+```yaml
+# Home Assistant Button Card
+type: button
+name: Enable Auto Backup
+tap_action:
+  action: call-service
+  service: mqtt.publish
+  service_data:
+    topic: snapsync/command
+    payload: auto_backup_enable
+
+# Home Assistant Automation - Auto-approve backups during work hours
+automation:
+  - alias: "Auto-approve SnapSync during work hours"
+    trigger:
+      - platform: mqtt
+        topic: "snapsync/pending_backup"
+    condition:
+      - condition: time
+        after: "09:00:00"
+        before: "17:00:00"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "snapsync/command"
+          payload: "approve_{{ trigger.payload_json.backup_id }}"
+```
+
+### Use Cases
+
+**Laptop Development Workflow:**
+```yaml
+# On laptop - always ask before backup
+backup:
+  require_approval: true
+  auto_backup_enabled: false  # Start with auto-backup disabled
+```
+
+**Raspberry Pi Auto-Backup:**
+```yaml
+# On dedicated server - automatic backups
+backup:
+  require_approval: false
+  auto_backup_enabled: true
+```
+
+**Conditional Auto-Backup:**
+```yaml
+# Start enabled, but allow manual control via UI
+backup:
+  require_approval: true  # Always ask
+  auto_backup_enabled: true  # But enabled by default
+```
 
 ## Usage
 

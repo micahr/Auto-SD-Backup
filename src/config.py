@@ -82,6 +82,8 @@ class BackupConfig:
     verify_checksums: bool = True
     max_retries: int = 3
     retry_delay: int = 5
+    require_approval: bool = False  # Require manual approval before starting backup
+    auto_backup_enabled: bool = True  # Can be toggled via UI/MQTT
 
 
 @dataclass

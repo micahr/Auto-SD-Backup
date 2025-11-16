@@ -64,6 +64,11 @@ This guide covers how to set up and develop SnapSync on macOS (or other non-Linu
    # Optional: Use dev mode for manual triggering
    sd_card:
      detection_mode: dev  # or "macos" to monitor /Volumes
+
+   # Recommended for laptop development - require approval
+   backup:
+     require_approval: true  # Ask before starting backups
+     auto_backup_enabled: false  # Start disabled
    ```
 
 ## Development Modes
@@ -170,6 +175,78 @@ python snapsync.py status
 ### View Sessions
 ```bash
 python snapsync.py sessions
+```
+
+## Testing Approval Workflow
+
+SnapSync supports an approval workflow for manual control over backups:
+
+### Enable Approval Mode
+
+Edit `config.yaml`:
+```yaml
+backup:
+  require_approval: true  # Require approval before starting
+  auto_backup_enabled: true  # Can toggle at runtime
+```
+
+### Test Approval via Web UI
+
+1. **Start the service**:
+   ```bash
+   python snapsync.py start
+   ```
+
+2. **Open web UI**: `http://localhost:8080`
+
+3. **Insert SD card** (or trigger manually):
+   ```bash
+   # In dev mode
+   python snapsync.py backup ~/test-sd-card
+   ```
+
+4. **Approve/Reject**:
+   - Check the "Pending Approval" section in the web UI
+   - Click "Approve" or "Reject"
+
+5. **Toggle Auto-Backup**:
+   - Use the toggle switch in the web UI
+   - When disabled, no backups will start
+
+### Test Approval via MQTT
+
+If you have MQTT enabled:
+
+```bash
+# Enable auto-backup
+mosquitto_pub -t "snapsync/command" -m "auto_backup_enable"
+
+# Disable auto-backup
+mosquitto_pub -t "snapsync/command" -m "auto_backup_disable"
+
+# Approve a pending backup (ID shown in logs or web UI)
+mosquitto_pub -t "snapsync/command" -m "approve_pending_TestSD_12345"
+
+# Reject a pending backup
+mosquitto_pub -t "snapsync/command" -m "reject_pending_TestSD_12345"
+```
+
+### Approval Use Cases
+
+**Development on Laptop:**
+```yaml
+# Recommended for development - always ask
+backup:
+  require_approval: true
+  auto_backup_enabled: false
+```
+
+**Production on Raspberry Pi:**
+```yaml
+# Automatic backups
+backup:
+  require_approval: false
+  auto_backup_enabled: true
 ```
 
 ## Testing Workflow

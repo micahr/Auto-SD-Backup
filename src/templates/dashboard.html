@@ -142,6 +142,93 @@
         .refresh-btn:hover {
             background: #2980b9;
         }
+
+        .btn {
+            border: none;
+            padding: 8px 16px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            margin: 0 5px;
+        }
+
+        .btn-approve {
+            background: #2ecc71;
+            color: white;
+        }
+
+        .btn-approve:hover {
+            background: #27ae60;
+        }
+
+        .btn-reject {
+            background: #e74c3c;
+            color: white;
+        }
+
+        .btn-reject:hover {
+            background: #c0392b;
+        }
+
+        .toggle-switch {
+            position: relative;
+            display: inline-block;
+            width: 60px;
+            height: 30px;
+        }
+
+        .toggle-switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: #ccc;
+            transition: .4s;
+            border-radius: 30px;
+        }
+
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 22px;
+            width: 22px;
+            left: 4px;
+            bottom: 4px;
+            background-color: white;
+            transition: .4s;
+            border-radius: 50%;
+        }
+
+        input:checked + .slider {
+            background-color: #2ecc71;
+        }
+
+        input:checked + .slider:before {
+            transform: translateX(30px);
+        }
+
+        .pending-backup {
+            background: #fff3cd;
+            border: 1px solid #ffc107;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 10px;
+        }
+
+        .pending-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
     </style>
 </head>
 <body>
@@ -158,6 +245,16 @@
                     <div class="stat-label">Status</div>
                     <div style="margin-top: 10px;">
                         <span id="status-badge" class="status-badge status-idle">Loading...</span>
+                    </div>
+                </div>
+                <div class="stat" style="margin-top: 15px;">
+                    <div class="stat-label">Auto-Backup</div>
+                    <div style="margin-top: 10px; display: flex; align-items: center;">
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="auto-backup-toggle" onchange="toggleAutoBackup()">
+                            <span class="slider"></span>
+                        </label>
+                        <span id="auto-backup-label" style="margin-left: 15px; font-size: 14px;">Disabled</span>
                     </div>
                 </div>
                 <div class="stat" style="margin-top: 15px;">
@@ -190,6 +287,12 @@
             </div>
         </div>
 
+        <!-- Pending Backups Section -->
+        <div id="pending-container" class="card" style="display: none;">
+            <h2>⏸️ Pending Approval</h2>
+            <div id="pending-list"></div>
+        </div>
+
         <div class="card">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
                 <h2 style="margin: 0;">Recent Sessions</h2>
@@ -215,6 +318,95 @@
             return date.toLocaleString();
         }
 
+        async function toggleAutoBackup() {
+            const toggle = document.getElementById('auto-backup-toggle');
+            const enabled = toggle.checked;
+
+            try {
+                const response = await fetch(`/api/auto-backup/${enabled ? 'enable' : 'disable'}`, {
+                    method: 'POST'
+                });
+
+                if (response.ok) {
+                    document.getElementById('auto-backup-label').textContent = enabled ? 'Enabled' : 'Disabled';
+                } else {
+                    // Revert toggle on error
+                    toggle.checked = !enabled;
+                    alert('Failed to toggle auto-backup');
+                }
+            } catch (error) {
+                console.error('Error toggling auto-backup:', error);
+                toggle.checked = !enabled;
+            }
+        }
+
+        async function approveBackup(backupId) {
+            try {
+                const response = await fetch(`/api/approve/${backupId}`, {
+                    method: 'POST'
+                });
+
+                if (response.ok) {
+                    await refreshData();
+                } else {
+                    alert('Failed to approve backup');
+                }
+            } catch (error) {
+                console.error('Error approving backup:', error);
+            }
+        }
+
+        async function rejectBackup(backupId) {
+            try {
+                const response = await fetch(`/api/reject/${backupId}`, {
+                    method: 'POST'
+                });
+
+                if (response.ok) {
+                    await refreshData();
+                } else {
+                    alert('Failed to reject backup');
+                }
+            } catch (error) {
+                console.error('Error rejecting backup:', error);
+            }
+        }
+
+        async function fetchPendingBackups() {
+            try {
+                const response = await fetch('/api/pending');
+                const pending = await response.json();
+
+                const pendingContainer = document.getElementById('pending-container');
+                const pendingList = document.getElementById('pending-list');
+
+                if (Object.keys(pending).length > 0) {
+                    pendingContainer.style.display = 'block';
+                    pendingList.innerHTML = Object.entries(pending).map(([id, backup]) => `
+                        <div class="pending-backup">
+                            <div class="pending-header">
+                                <div>
+                                    <strong>${backup.device_name}</strong>
+                                    <div style="font-size: 12px; color: #7f8c8d; margin-top: 5px;">
+                                        ${backup.mount_point}
+                                        ${backup.size > 0 ? ' - ' + formatBytes(backup.size) : ''}
+                                    </div>
+                                </div>
+                                <div>
+                                    <button class="btn btn-approve" onclick="approveBackup('${id}')">✓ Approve</button>
+                                    <button class="btn btn-reject" onclick="rejectBackup('${id}')">✗ Reject</button>
+                                </div>
+                            </div>
+                        </div>
+                    `).join('');
+                } else {
+                    pendingContainer.style.display = 'none';
+                }
+            } catch (error) {
+                console.error('Error fetching pending backups:', error);
+            }
+        }
+
         async function fetchStatus() {
             try {
                 const response = await fetch('/api/status');
@@ -223,6 +415,12 @@
                 const statusBadge = document.getElementById('status-badge');
                 statusBadge.textContent = data.status || 'idle';
                 statusBadge.className = 'status-badge status-' + (data.status || 'idle');
+
+                // Update auto-backup toggle
+                const autoBackupToggle = document.getElementById('auto-backup-toggle');
+                const autoBackupLabel = document.getElementById('auto-backup-label');
+                autoBackupToggle.checked = data.auto_backup_enabled || false;
+                autoBackupLabel.textContent = data.auto_backup_enabled ? 'Enabled' : 'Disabled';
 
                 const currentSession = document.getElementById('current-session');
                 if (data.current_session) {
@@ -297,15 +495,16 @@
             await Promise.all([
                 fetchStatus(),
                 fetchStats(),
-                fetchSessions()
+                fetchSessions(),
+                fetchPendingBackups()
             ]);
         }
 
         // Initial load
         refreshData();
 
-        // Auto-refresh every 5 seconds
-        setInterval(refreshData, 5000);
+        // Auto-refresh every 2 seconds (faster for pending approvals)
+        setInterval(refreshData, 2000);
     </script>
 </body>
 </html>

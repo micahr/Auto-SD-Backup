@@ -95,3 +95,9 @@ backup:
   # Retry failed uploads
   max_retries: 3
   retry_delay: 5
+  # Require manual approval before starting backup (useful for laptops)
+  # When enabled, SD card insertions will wait for approval via web UI or MQTT
+  require_approval: false
+  # Auto-backup enabled by default (can be toggled via web UI or MQTT)
+  # This is a runtime toggle - set to false to start with auto-backup disabled
+  auto_backup_enabled: true

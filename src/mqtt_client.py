@@ -12,11 +12,12 @@ logger = logging.getLogger(__name__)
 class MQTTClient:
     """MQTT client for publishing to Home Assistant"""
 
-    def __init__(self, config: MQTTConfig):
+    def __init__(self, config: MQTTConfig, service=None):
         self.config = config
         self.client: Optional[mqtt.Client] = None
         self._connected = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._service = service  # Reference to BackupService for command handling
 
     async def initialize(self):
         """Initialize MQTT client and connect to broker"""
@@ -51,6 +52,11 @@ class MQTTClient:
             # Send discovery messages
             await self._send_discovery()
 
+            # Subscribe to command topic
+            command_topic = f"{self.config.topic_prefix}/command"
+            self.client.subscribe(command_topic, qos=1)
+            logger.info(f"Subscribed to command topic: {command_topic}")
+
             logger.info("MQTT client initialized and connected")
 
         except Exception as e:
@@ -83,6 +89,50 @@ class MQTTClient:
     def _on_message(self, client, userdata, msg):
         """Callback for when a message is received"""
         logger.debug(f"Received message on {msg.topic}: {msg.payload}")
+
+        # Handle command messages
+        command_topic = f"{self.config.topic_prefix}/command"
+        if msg.topic == command_topic and self._service:
+            try:
+                command = msg.payload.decode('utf-8').strip()
+                logger.info(f"Received command: {command}")
+
+                # Schedule command handling in the event loop
+                if self._loop:
+                    asyncio.run_coroutine_threadsafe(
+                        self._handle_command(command),
+                        self._loop
+                    )
+            except Exception as e:
+                logger.error(f"Error processing command: {e}", exc_info=True)
+
+    async def _handle_command(self, command: str):
+        """Handle received MQTT commands"""
+        try:
+            if command == "auto_backup_enable":
+                await self._service.set_auto_backup(True)
+                logger.info("Auto-backup enabled via MQTT")
+            elif command == "auto_backup_disable":
+                await self._service.set_auto_backup(False)
+                logger.info("Auto-backup disabled via MQTT")
+            elif command.startswith("approve_"):
+                backup_id = command.replace("approve_", "")
+                success = await self._service.approve_backup(backup_id)
+                if success:
+                    logger.info(f"Backup {backup_id} approved via MQTT")
+                else:
+                    logger.warning(f"Failed to approve backup {backup_id}")
+            elif command.startswith("reject_"):
+                backup_id = command.replace("reject_", "")
+                success = await self._service.reject_backup(backup_id)
+                if success:
+                    logger.info(f"Backup {backup_id} rejected via MQTT")
+                else:
+                    logger.warning(f"Failed to reject backup {backup_id}")
+            else:
+                logger.warning(f"Unknown command: {command}")
+        except Exception as e:
+            logger.error(f"Error handling command '{command}': {e}", exc_info=True)
 
     async def _send_discovery(self):
         """Send Home Assistant MQTT discovery messages"""
@@ -263,4 +313,27 @@ class MQTTClient:
         await self._publish(
             f"{self.config.topic_prefix}/error",
             error_message
+        )
+
+    async def publish_pending_backup(self, backup_id: str, sd_card):
+        """Publish pending backup information"""
+        pending_data = {
+            "backup_id": backup_id,
+            "device_name": sd_card.device_name,
+            "mount_point": sd_card.mount_point,
+            "size": sd_card.size,
+            "label": sd_card.label
+        }
+
+        await self._publish(
+            f"{self.config.topic_prefix}/pending_backup",
+            json.dumps(pending_data)
+        )
+
+    async def publish_auto_backup_status(self, enabled: bool):
+        """Publish auto-backup enabled/disabled status"""
+        await self._publish(
+            f"{self.config.topic_prefix}/auto_backup",
+            "enabled" if enabled else "disabled",
+            retain=True
         )

@@ -93,6 +93,60 @@ def create_app(service_manager) -> FastAPI:
             logger.error(f"Error retrying file: {e}")
             return JSONResponse({"error": str(e)}, status_code=500)
 
+    @app.get("/api/pending")
+    async def get_pending_backups():
+        """Get list of pending backups"""
+        try:
+            pending = await service_manager.get_pending_backups()
+            return JSONResponse(pending)
+        except Exception as e:
+            logger.error(f"Error getting pending backups: {e}")
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.post("/api/approve/{backup_id}")
+    async def approve_backup(backup_id: str):
+        """Approve a pending backup"""
+        try:
+            success = await service_manager.approve_backup(backup_id)
+            if success:
+                return JSONResponse({"message": "Backup approved", "backup_id": backup_id})
+            return JSONResponse({"error": "Backup not found"}, status_code=404)
+        except Exception as e:
+            logger.error(f"Error approving backup: {e}")
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.post("/api/reject/{backup_id}")
+    async def reject_backup(backup_id: str):
+        """Reject a pending backup"""
+        try:
+            success = await service_manager.reject_backup(backup_id)
+            if success:
+                return JSONResponse({"message": "Backup rejected", "backup_id": backup_id})
+            return JSONResponse({"error": "Backup not found"}, status_code=404)
+        except Exception as e:
+            logger.error(f"Error rejecting backup: {e}")
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.post("/api/auto-backup/enable")
+    async def enable_auto_backup():
+        """Enable auto-backup"""
+        try:
+            await service_manager.set_auto_backup(True)
+            return JSONResponse({"message": "Auto-backup enabled"})
+        except Exception as e:
+            logger.error(f"Error enabling auto-backup: {e}")
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.post("/api/auto-backup/disable")
+    async def disable_auto_backup():
+        """Disable auto-backup"""
+        try:
+            await service_manager.set_auto_backup(False)
+            return JSONResponse({"message": "Auto-backup disabled"})
+        except Exception as e:
+            logger.error(f"Error disabling auto-backup: {e}")
+            return JSONResponse({"error": str(e)}, status_code=500)
+
     @app.get("/health")
     async def health_check():
         """Health check endpoint"""

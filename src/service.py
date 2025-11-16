@@ -31,6 +31,8 @@ class ServiceManager:
         self._running = False
         self._current_status = "idle"
         self._web_server: Optional[uvicorn.Server] = None
+        self._pending_backups: dict[str, SDCard] = {}  # Pending approval backups
+        self._auto_backup_enabled = True  # Runtime toggle
 
     async def start(self):
         """Start all service components"""
@@ -75,7 +77,7 @@ class ServiceManager:
 
             # Initialize MQTT client if enabled
             if self.config.mqtt.enabled:
-                self.mqtt_client = MQTTClient(self.config.mqtt)
+                self.mqtt_client = MQTTClient(self.config.mqtt, service=self)
                 await self.mqtt_client.initialize()
                 await self.mqtt_client.publish_status("idle")
 
@@ -179,16 +181,30 @@ class ServiceManager:
         logger.info(f"SD card inserted: {sd_card.device_name} at {sd_card.mount_point}")
 
         try:
-            # Update status
-            self._current_status = "backing_up"
+            # Check if auto-backup is enabled
+            if not self._auto_backup_enabled:
+                logger.info("Auto-backup is disabled, ignoring SD card")
+                return
 
-            if self.mqtt_client:
-                await self.mqtt_client.publish_status("backing_up")
+            # Check if approval is required
+            if self.config.backup.require_approval:
+                # Add to pending queue
+                backup_id = f"pending_{sd_card.device_name}_{id(sd_card)}"
+                self._pending_backups[backup_id] = sd_card
+                self._current_status = "pending_approval"
 
-            # Start backup
-            session_id = await self.backup_engine.start_backup(sd_card)
+                logger.warning(f"⏸️  Backup pending approval for: {sd_card.device_name}")
+                logger.warning(f"  Approve via web UI (http://localhost:{self.config.service.web_ui_port})")
+                logger.warning(f"  or MQTT command: snapsync/command approve {backup_id}")
 
-            logger.info(f"Backup started with session ID: {session_id}")
+                if self.mqtt_client:
+                    await self.mqtt_client.publish_status("pending_approval")
+                    await self.mqtt_client.publish_pending_backup(backup_id, sd_card)
+
+                return
+
+            # Auto-start backup
+            await self._start_backup(sd_card)
 
         except Exception as e:
             logger.error(f"Error handling SD card insertion: {e}", exc_info=True)
@@ -198,6 +214,18 @@ class ServiceManager:
                 await self.mqtt_client.publish_status("failed")
 
             self._current_status = "failed"
+
+    async def _start_backup(self, sd_card: SDCard):
+        """Start backup for an SD card"""
+        self._current_status = "backing_up"
+
+        if self.mqtt_client:
+            await self.mqtt_client.publish_status("backing_up")
+
+        # Start backup
+        session_id = await self.backup_engine.start_backup(sd_card)
+
+        logger.info(f"Backup started with session ID: {session_id}")
 
     async def _on_sd_card_removed(self, sd_card: SDCard):
         """Handle SD card removal event"""
@@ -253,7 +281,57 @@ class ServiceManager:
             "current_session": active_session,
             "immich_enabled": self.config.immich.enabled,
             "unraid_enabled": self.config.unraid.enabled,
-            "mqtt_enabled": self.config.mqtt.enabled
+            "mqtt_enabled": self.config.mqtt.enabled,
+            "auto_backup_enabled": self._auto_backup_enabled,
+            "require_approval": self.config.backup.require_approval,
+            "pending_backups": list(self._pending_backups.keys())
+        }
+
+    async def approve_backup(self, backup_id: str) -> bool:
+        """Approve a pending backup"""
+        if backup_id not in self._pending_backups:
+            logger.error(f"Backup {backup_id} not found in pending queue")
+            return False
+
+        sd_card = self._pending_backups.pop(backup_id)
+        logger.info(f"✓ Backup approved for: {sd_card.device_name}")
+
+        await self._start_backup(sd_card)
+        return True
+
+    async def reject_backup(self, backup_id: str) -> bool:
+        """Reject a pending backup"""
+        if backup_id not in self._pending_backups:
+            logger.error(f"Backup {backup_id} not found in pending queue")
+            return False
+
+        sd_card = self._pending_backups.pop(backup_id)
+        logger.info(f"✗ Backup rejected for: {sd_card.device_name}")
+
+        if self.mqtt_client:
+            await self.mqtt_client.publish_status("idle")
+
+        self._current_status = "idle"
+        return True
+
+    async def set_auto_backup(self, enabled: bool):
+        """Enable or disable auto-backup"""
+        self._auto_backup_enabled = enabled
+        logger.info(f"Auto-backup {'enabled' if enabled else 'disabled'}")
+
+        if self.mqtt_client:
+            await self.mqtt_client.publish_auto_backup_status(enabled)
+
+    async def get_pending_backups(self) -> dict:
+        """Get list of pending backups"""
+        return {
+            backup_id: {
+                "device_name": card.device_name,
+                "mount_point": card.mount_point,
+                "size": card.size,
+                "label": card.label
+            }
+            for backup_id, card in self._pending_backups.items()
         }
 
     async def trigger_backup(self, path: str) -> str:
