@@ -29,8 +29,14 @@ echo "Installing for user: $INSTALL_USER"
 echo "Home directory: $INSTALL_HOME"
 echo ""
 
-# Installation directory
-INSTALL_DIR="$INSTALL_HOME/snapsync"
+# Get the absolute path of the script's directory
+INSTALL_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+echo "Installing from directory: $INSTALL_DIR"
+echo ""
+
+# Ensure the user owns the installation directory
+chown -R "$INSTALL_USER:$INSTALL_USER" "$INSTALL_DIR"
 
 # Check Python version
 echo "Checking Python version..."
@@ -46,16 +52,6 @@ echo ""
 echo "Installing system dependencies..."
 apt-get update
 apt-get install -y python3-pip python3-venv libudev-dev
-
-# Create installation directory
-echo ""
-echo "Creating installation directory..."
-mkdir -p "$INSTALL_DIR"
-
-# Copy files
-echo "Copying files..."
-cp -r . "$INSTALL_DIR/"
-chown -R "$INSTALL_USER:$INSTALL_USER" "$INSTALL_DIR"
 
 # Create virtual environment
 echo ""
