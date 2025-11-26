@@ -33,6 +33,7 @@ class ServiceManager:
         self._web_server: Optional[uvicorn.Server] = None
         self._pending_backups: dict[str, SDCard] = {}  # Pending approval backups
         self._auto_backup_enabled = True  # Runtime toggle
+        self._detector_task = None
 
     async def start(self):
         """Start all service components"""
@@ -108,21 +109,37 @@ class ServiceManager:
             self._running = True
             logger.info("SnapSync service started successfully")
 
-            await self.sd_detector.start()
+            # Start SD card detection in the background
+            self._detector_task = asyncio.create_task(self.sd_detector.start())
 
-        except Exception as e:
-            logger.error(f"Failed to start service: {e}", exc_info=True)
+            # Wait indefinitely until the service is stopped
+            while self._running:
+                await asyncio.sleep(1)
+
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            logger.info("Service interruption detected.")
+        finally:
+            logger.info("Service shutting down.")
             await self.stop()
-            raise
 
     async def stop(self):
         """Stop all service components"""
+        if not self._running:
+            return  # Avoid multiple stop calls
+
         logger.info("Stopping SnapSync service...")
         self._running = False
 
-        # Stop SD card detector
+        # Stop SD card detector task
         if self.sd_detector:
-            await self.sd_detector.stop()
+            await self.sd_detector.stop()  # Signal the loop to stop
+
+        if self._detector_task:
+            self._detector_task.cancel()
+            try:
+                await self._detector_task
+            except asyncio.CancelledError:
+                pass  # This is expected
 
         # Close MQTT client
         if self.mqtt_client:
@@ -141,8 +158,10 @@ class ServiceManager:
             await self.database.close()
 
         # Stop web server
-        if self._web_server:
+        if self._web_server and self._web_server.started:
             self._web_server.should_exit = True
+            # Give it a moment to shut down uvicorn's server
+            await asyncio.sleep(0.1)
 
         logger.info("SnapSync service stopped")
 
