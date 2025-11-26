@@ -9,7 +9,7 @@ import uuid
 from .database import BackupDatabase, calculate_file_hash
 from .immich_client import ImmichClient
 from .unraid_client import UnraidClient
-from .sd_detector import SDCard
+from .sd_detector_cross_platform import SDCard
 from .config import Config
 
 logger = logging.getLogger(__name__)
@@ -71,6 +71,7 @@ class BackupEngine:
                 'session_id': session_id,
                 'device_name': sd_card.device_name,
                 'device_path': sd_card.device_path,
+                'mount_point': sd_card.mount_point,
                 'status': 'backing_up',
                 'total_files': total_files,
                 'total_bytes': total_bytes
@@ -254,21 +255,27 @@ class BackupEngine:
                         unraid_uploaded = True
                         unraid_path = result
 
-                # Verify uploads if configured
-                if self.config.backup.verify_checksums:
-                    await self._verify_uploads(
-                        file_id, file_path, file_info,
-                        immich_asset_id if immich_uploaded else None,
-                        unraid_path if unraid_uploaded else None
+                # Check for overall success based on upload status and verification
+                upload_success = (self.config.immich.enabled is False or immich_uploaded) and \
+                                 (self.config.unraid.enabled is False or unraid_uploaded)
+
+                verification_success = True
+                if upload_success and self.config.backup.verify_checksums:
+                    verification_success = await self._verify_uploads(
+                        file_path, file_info,
+                        immich_asset_id,
+                        unraid_path
                     )
+                
+                success = upload_success and verification_success
+                final_status = 'completed' if success else 'failed'
+                error_message = "Verification failed" if not verification_success else None
 
-                # Update database
-                success = (immich_uploaded or not self.config.immich.enabled) and \
-                         (unraid_uploaded or not self.config.unraid.enabled)
-
+                # Update database with the final status
                 await self.database.update_file_status(
                     file_id,
-                    'completed' if success else 'failed',
+                    final_status,
+                    error_message=error_message,
                     immich_uploaded=immich_uploaded,
                     unraid_uploaded=unraid_uploaded,
                     immich_asset_id=immich_asset_id,
@@ -287,7 +294,7 @@ class BackupEngine:
                         error_message=str(e)
                     )
 
-                # Retry logic
+                # Retry logic - not fully implemented in original but we keep placeholder
                 if file_id and file_info.get('retry_count', 0) < self.config.backup.max_retries:
                     await self.database.increment_retry_count(file_id)
                     await asyncio.sleep(self.config.backup.retry_delay)
@@ -324,26 +331,33 @@ class BackupEngine:
 
     async def _verify_uploads(
         self,
-        file_id: int,
         file_path: Path,
         file_info: dict,
         immich_asset_id: Optional[str],
         unraid_path: Optional[str]
-    ):
-        """Verify uploaded files match source"""
+    ) -> bool:
+        """
+        Verify uploaded files match source.
+
+        Returns:
+            True if all enabled verifications pass, False otherwise.
+        """
         logger.debug(f"Verifying uploads for {file_info['file_name']}...")
+        all_verified = True
 
         # Verify Immich
-        if immich_asset_id and self.immich_client:
+        if self.config.immich.enabled and immich_asset_id and self.immich_client:
             if not await self.immich_client.verify_asset(immich_asset_id):
                 logger.warning(f"Immich verification failed for {file_info['file_name']}")
-                await self.database.update_file_status(file_id, 'failed', error_message="Immich verification failed")
+                all_verified = False
 
         # Verify Unraid
-        if unraid_path and self.unraid_client:
+        if self.config.unraid.enabled and unraid_path and self.unraid_client:
             if not await self.unraid_client.verify_file(unraid_path, file_info['file_size']):
                 logger.warning(f"Unraid verification failed for {file_info['file_name']}")
-                await self.database.update_file_status(file_id, 'failed', error_message="Unraid verification failed")
+                all_verified = False
+        
+        return all_verified
 
     async def get_session_status(self, session_id: str) -> Optional[dict]:
         """Get current status of a backup session"""

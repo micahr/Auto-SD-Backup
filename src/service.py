@@ -13,6 +13,7 @@ from .unraid_client import UnraidClient
 from .backup_engine import BackupEngine
 from .mqtt_client import MQTTClient
 from .web_ui import create_app
+from .eject import eject_device
 
 logger = logging.getLogger(__name__)
 
@@ -34,14 +35,37 @@ class ServiceManager:
         self._pending_backups: dict[str, SDCard] = {}  # Pending approval backups
         self._auto_backup_enabled = True  # Runtime toggle
         self._detector_task = None
+        self._web_server_task = None
 
     async def start(self):
         """Start all service components"""
         logger.info("Starting SnapSync service...")
 
         try:
+            self._running = True
+            logger.info("SnapSync service started successfully")
+
             # Setup logging level
             logging.getLogger().setLevel(getattr(logging, self.config.service.log_level))
+
+            # Reduce log level for smbprotocol to avoid excessive logging
+            logging.getLogger('smbprotocol').setLevel(logging.WARNING)
+
+            # Configure separate log for HTTP traffic if specified
+            if self.config.service.http_log_path:
+                http_loggers = ['httpx', 'uvicorn', 'uvicorn.access', 'uvicorn.error']
+                file_handler = logging.FileHandler(self.config.service.http_log_path)
+                file_handler.setFormatter(
+                    logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+                )
+
+                for logger_name in http_loggers:
+                    http_logger = logging.getLogger(logger_name)
+                    http_logger.setLevel(logging.INFO)  # Capture INFO and above for HTTP traffic
+                    http_logger.addHandler(file_handler)
+                    http_logger.propagate = False
+                
+                logger.info(f"Redirecting HTTP logs to {self.config.service.http_log_path}")
 
             # Initialize database
             self.database = BackupDatabase(self.config.service.database_path)
@@ -100,14 +124,7 @@ class ServiceManager:
             )
 
             # Start web server in background
-            asyncio.create_task(self._start_web_server())
-
-            # Setup signal handlers
-            self._setup_signal_handlers()
-
-            # Start SD card detection
-            self._running = True
-            logger.info("SnapSync service started successfully")
+            self._web_server_task = asyncio.create_task(self._start_web_server())
 
             # Start SD card detection in the background
             self._detector_task = asyncio.create_task(self.sd_detector.start())
@@ -118,6 +135,8 @@ class ServiceManager:
 
         except (asyncio.CancelledError, KeyboardInterrupt):
             logger.info("Service interruption detected.")
+        except Exception as e:
+            logger.error(f"Unexpected error in service loop: {e}", exc_info=True)
         finally:
             logger.info("Service shutting down.")
             await self.stop()
@@ -143,7 +162,7 @@ class ServiceManager:
 
         # Close MQTT client
         if self.mqtt_client:
-            await self.mqtt_client.close()
+            self.mqtt_client.close()
 
         # Close Immich client
         if self.immich_client:
@@ -157,23 +176,18 @@ class ServiceManager:
         if self.database:
             await self.database.close()
 
-        # Stop web server
+        # Stop web server task
         if self._web_server and self._web_server.started:
             self._web_server.should_exit = True
-            # Give it a moment to shut down uvicorn's server
-            await asyncio.sleep(0.1)
+        
+        if self._web_server_task:
+            self._web_server_task.cancel()
+            try:
+                await self._web_server_task
+            except asyncio.CancelledError:
+                pass
 
         logger.info("SnapSync service stopped")
-
-    def _setup_signal_handlers(self):
-        """Setup signal handlers for graceful shutdown"""
-        loop = asyncio.get_event_loop()
-
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(
-                sig,
-                lambda: asyncio.create_task(self.stop())
-            )
 
     async def _start_web_server(self):
         """Start the web UI server"""
@@ -184,13 +198,34 @@ class ServiceManager:
                 app,
                 host="0.0.0.0",
                 port=self.config.service.web_ui_port,
-                log_level="info"
+                log_level="info",
+                lifespan="off",  # Disable lifespan to prevent CancelledError on force exit
             )
+            # Disable uvicorn's signal handlers to allow the main application to manage shutdown
+            # We set this directly on the config object to bypass version compatibility issues
+            config.install_signal_handlers = False
 
             self._web_server = uvicorn.Server(config)
+            
+            # Forcefully disable signal handlers by monkey-patching the method
+            # This ensures uvicorn cannot hijack the main application's loop
+            self._web_server.install_signal_handlers = lambda: None
+
+            # If redirecting logs, remove the default console handler uvicorn adds to the access logger
+            if self.config.service.http_log_path:
+                access_logger = logging.getLogger('uvicorn.access')
+                # Remove all handlers that are StreamHandlers to prevent console output
+                access_logger.handlers = [
+                    h for h in access_logger.handlers
+                    if not isinstance(h, logging.StreamHandler)
+                ]
 
             logger.info(f"Starting web UI on port {self.config.service.web_ui_port}")
-            await self._web_server.serve()
+            try:
+                await self._web_server.serve()
+            except asyncio.CancelledError:
+                # This is expected during forceful shutdown
+                pass
 
         except Exception as e:
             logger.error(f"Error starting web server: {e}", exc_info=True)
@@ -283,6 +318,11 @@ class ServiceManager:
             if self.mqtt_client:
                 await self.mqtt_client.publish_session_complete(session or {})
                 await self.mqtt_client.publish_status("completed")
+
+            # Auto-eject if enabled and successful
+            if self.config.backup.auto_eject and failed == 0 and session and session.get('mount_point'):
+                logger.info(f"Auto-ejecting {session['mount_point']}...")
+                await eject_device(session['mount_point'])
 
             # Return to idle after a short delay
             await asyncio.sleep(5)

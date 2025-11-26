@@ -38,17 +38,59 @@ class ImmichClient:
 
     async def check_connection(self) -> bool:
         """Verify connection to Immich server"""
-        try:
-            response = await self.client.get('/api/server-info/ping')
-            if response.status_code == 200:
-                logger.info("Immich server connection verified")
-                return True
-            else:
-                logger.error(f"Immich server returned status {response.status_code}")
+        endpoints_to_try = [
+            '/server-info',  # Most common endpoint (without /api prefix)
+            '/api/user/me',  # Check authenticated user - requires valid API key
+            '/api/server-info',
+            '/api/server-info/ping',
+            '/api/server-version',
+            '/api/',  # Root API endpoint
+        ]
+        
+        for endpoint in endpoints_to_try:
+            try:
+                full_url = f"{self.url}{endpoint}"
+                logger.debug(f"Trying to connect to Immich at {full_url}")
+                response = await self.client.get(endpoint)
+                
+                if response.status_code == 200:
+                    logger.info(f"Immich server connection verified via {endpoint}")
+                    if endpoint == '/api/user/me':
+                        try:
+                            user_data = response.json()
+                            logger.info(f"Authenticated as: {user_data.get('email', 'unknown user')}")
+                        except:
+                            pass
+                    return True
+                elif response.status_code == 401:
+                    logger.error(f"Authentication failed - API key may be invalid")
+                    logger.error(f"Response: {response.text[:200]}")
+                    return False
+                elif response.status_code == 404:
+                    logger.debug(f"Endpoint {endpoint} not found (404), trying next...")
+                    continue
+                else:
+                    logger.debug(f"Immich server returned status {response.status_code} for {endpoint}")
+                    # Still try other endpoints
+                    continue
+            except httpx.ConnectError as e:
+                logger.error(f"Failed to connect to Immich server at {self.url}: {e}")
+                logger.error("Please verify:")
+                logger.error(f"  1. The server is running at {self.url}")
+                logger.error(f"  2. The URL is correct (should be like http://host:port)")
+                logger.error(f"  3. The server is accessible from this machine")
                 return False
-        except Exception as e:
-            logger.error(f"Failed to connect to Immich server: {e}")
-            return False
+            except Exception as e:
+                logger.debug(f"Error trying {endpoint}: {e}")
+                continue
+        
+        # If we get here, none of the endpoints worked, but server is responding
+        # This might be okay - the endpoints might have changed, but uploads could still work
+        logger.warning(f"Could not verify Immich server connection at {self.url}")
+        logger.warning("Tried endpoints: " + ", ".join(endpoints_to_try))
+        logger.warning("Server is responding but endpoints may have changed.")
+        logger.warning("Will attempt to continue - first upload will be the real test.")
+        return True  # Return True to allow service to continue - actual upload will test if it works
 
     async def upload_asset(
         self,
@@ -88,7 +130,7 @@ class ImmichClient:
 
                 # Upload to Immich
                 response = await self.client.post(
-                    '/api/asset/upload',
+                    '/api/assets',
                     files=files,
                     data=data
                 )
@@ -108,7 +150,7 @@ class ImmichClient:
     async def verify_asset(self, asset_id: str) -> bool:
         """Verify that an asset exists in Immich"""
         try:
-            response = await self.client.get(f'/api/asset/assetById/{asset_id}')
+            response = await self.client.get(f'/api/assets/{asset_id}')
             return response.status_code == 200
         except Exception as e:
             logger.error(f"Error verifying asset {asset_id}: {e}")

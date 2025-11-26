@@ -12,10 +12,21 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ServiceConfig:
     """Service configuration"""
-    name: str = "SnapSync"
-    database_path: str = "./snapsync.db"
+    name: str = "SD Card Backup Service"
+    database_path: str = "./backup.db"
     log_level: str = "INFO"
     web_ui_port: int = 8080
+    http_log_path: Optional[str] = None
+
+    @staticmethod
+    def from_dict(data: dict) -> 'ServiceConfig':
+        return ServiceConfig(
+            name=data.get('name', "SD Card Backup Service"),
+            database_path=data.get('database_path', "./backup.db"),
+            log_level=data.get('log_level', "INFO"),
+            web_ui_port=data.get('web_ui_port', 8080),
+            http_log_path=data.get('http_log_path')
+        )
 
 
 @dataclass
@@ -82,8 +93,22 @@ class BackupConfig:
     verify_checksums: bool = True
     max_retries: int = 3
     retry_delay: int = 5
-    require_approval: bool = False  # Require manual approval before starting backup
-    auto_backup_enabled: bool = True  # Can be toggled via UI/MQTT
+    require_approval: bool = False
+    auto_backup_enabled: bool = True
+    auto_eject: bool = False
+
+    @staticmethod
+    def from_dict(data: dict) -> 'BackupConfig':
+        return BackupConfig(
+            parallel=data.get('parallel', True),
+            concurrent_files=data.get('concurrent_files', 3),
+            verify_checksums=data.get('verify_checksums', True),
+            max_retries=data.get('max_retries', 3),
+            retry_delay=data.get('retry_delay', 5),
+            require_approval=data.get('require_approval', False),
+            auto_backup_enabled=data.get('auto_backup_enabled', True),
+            auto_eject=data.get('auto_eject', False)
+        )
 
 
 @dataclass
@@ -147,7 +172,28 @@ class Config:
 
     @staticmethod
     def _load_env_vars(data: Dict[str, Any]):
-        """Load sensitive values from environment variables"""
+        """Load sensitive values from environment variables
+        
+        Only uses values from .env if they're not placeholder values.
+        This allows .env to be optional - if it has placeholder values,
+        config.yaml values will be used instead.
+        """
+        # Placeholder patterns to skip
+        placeholders = [
+            'your-immich-api-key-here',
+            'your-unraid-username',
+            'your-unraid-password',
+            'your-mqtt-username',
+            'your-mqtt-password',
+            '',  # Empty values are also placeholders
+        ]
+        
+        def is_placeholder(value: str) -> bool:
+            """Check if a value is a placeholder"""
+            if not value:
+                return True
+            return value.strip() in placeholders or value.strip().startswith('your-')
+        
         # Check for .env file
         env_file = Path('.env')
         if env_file.exists():
@@ -156,24 +202,33 @@ class Config:
                     line = line.strip()
                     if line and not line.startswith('#'):
                         key, _, value = line.partition('=')
-                        os.environ[key.strip()] = value.strip()
+                        key = key.strip()
+                        value = value.strip()
+                        # Only set if it's not a placeholder
+                        if not is_placeholder(value):
+                            os.environ[key] = value
 
-        # Override with environment variables
+        # Override with environment variables (only if not placeholders)
         if 'immich' in data:
             if api_key := os.getenv('IMMICH_API_KEY'):
-                data['immich']['api_key'] = api_key
+                if not is_placeholder(api_key):
+                    data['immich']['api_key'] = api_key
 
         if 'unraid' in data:
             if username := os.getenv('UNRAID_USERNAME'):
-                data['unraid']['username'] = username
+                if not is_placeholder(username):
+                    data['unraid']['username'] = username
             if password := os.getenv('UNRAID_PASSWORD'):
-                data['unraid']['password'] = password
+                if not is_placeholder(password):
+                    data['unraid']['password'] = password
 
         if 'mqtt' in data:
             if username := os.getenv('MQTT_USERNAME'):
-                data['mqtt']['username'] = username
+                if not is_placeholder(username):
+                    data['mqtt']['username'] = username
             if password := os.getenv('MQTT_PASSWORD'):
-                data['mqtt']['password'] = password
+                if not is_placeholder(password):
+                    data['mqtt']['password'] = password
 
     @staticmethod
     def save_env_vars(updates: Dict[str, str]):

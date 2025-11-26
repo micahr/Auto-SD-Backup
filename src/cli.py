@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 from .config import Config
 from .service import ServiceManager
+from .database import BackupDatabase # Added import
 
 # Setup logging
 logging.basicConfig(
@@ -39,10 +40,8 @@ def start(ctx):
         service = ServiceManager(config)
         await service.start()
 
-    try:
-        asyncio.run(run())
-    except KeyboardInterrupt:
-        click.echo("\nShutting down...")
+    asyncio.run(run())
+    click.echo("\nSnapSync service shut down.")
 
 
 @cli.command()
@@ -329,6 +328,38 @@ def backup(ctx, path):
     asyncio.run(run_backup())
 
 
+async def _reset_database_async(config_path: str):
+    """Asynchronous function to reset the database."""
+    config = Config.from_file(config_path)
+    db = BackupDatabase(config.service.database_path)
+    await db.initialize()
+    await db.reset()
+    await db.close()
+
+
+@cli.command(name='reset-db')
+@click.pass_context
+def reset_db(ctx):
+    """
+    Delete all records from the database.
+
+    This is a destructive operation. It will erase all backup history,
+    allowing files to be re-uploaded from an SD card.
+    """
+    config_path = ctx.obj['config_path']
+
+    if not click.confirm(
+        "⚠️  Are you sure you want to delete all backup history? This cannot be undone.",
+        abort=True
+    ):
+        return  # This line is technically not needed due to abort=True, but is good for clarity
+
+    click.echo("Resetting database...")
+
+    asyncio.run(_reset_database_async(config_path))
+    click.echo("✅ Database has been reset.")
+
+
 def main():
     """Entry point for the CLI"""
     cli(obj={})
@@ -336,3 +367,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

@@ -2,6 +2,7 @@
 import json
 import logging
 import asyncio
+import threading
 from typing import Optional, Dict, Any
 import paho.mqtt.client as mqtt
 from .config import MQTTConfig
@@ -63,14 +64,27 @@ class MQTTClient:
             logger.error(f"Failed to initialize MQTT client: {e}", exc_info=True)
             raise
 
-    async def close(self):
-        """Close MQTT connection"""
-        if self.client:
-            # Send offline status
-            await self.publish_status("offline")
-            self.client.loop_stop()
-            self.client.disconnect()
-            logger.info("MQTT client disconnected")
+    def close(self):
+        """Disconnect from MQTT broker in a background thread."""
+        if not self.client:
+            return
+
+        # The loop_stop() and disconnect() methods are blocking.
+        # Run them in a daemon thread to avoid blocking the asyncio event loop
+        # during shutdown, which can cause hangs.
+        def _do_disconnect():
+            try:
+                logger.info("Stopping MQTT client loop...")
+                # Don't try to publish while disconnecting
+                self.client.loop_stop()
+                self.client.disconnect()
+                logger.info("MQTT client disconnected.")
+            except Exception as e:
+                logger.warning(f"Error during MQTT disconnect: {e}")
+
+        # Best effort cleanup in a daemon thread
+        cleanup_thread = threading.Thread(target=_do_disconnect, daemon=True)
+        cleanup_thread.start()
 
     def _on_connect(self, client, userdata, flags, rc):
         """Callback for when client connects to broker"""

@@ -21,7 +21,18 @@ class BackupDatabase:
         self.db = await aiosqlite.connect(self.db_path)
         self.db.row_factory = aiosqlite.Row
         await self._create_tables()
+        await self._migrate_schema()  # Ensure schema is up-to-date
         logger.info(f"Database initialized at {self.db_path}")
+
+    async def _migrate_schema(self):
+        """Perform simple schema migrations to keep the DB up-to-date."""
+        # Migration for adding 'mount_point' to 'backup_sessions'
+        cursor = await self.db.execute("PRAGMA table_info(backup_sessions)")
+        columns = [row['name'] for row in await cursor.fetchall()]
+        if 'mount_point' not in columns:
+            logger.info("Applying schema migration: Adding 'mount_point' to 'backup_sessions' table.")
+            await self.db.execute("ALTER TABLE backup_sessions ADD COLUMN mount_point TEXT")
+            await self.db.commit()
 
     async def _create_tables(self):
         """Create database tables if they don't exist"""
@@ -53,6 +64,7 @@ class BackupDatabase:
                 session_id TEXT UNIQUE NOT NULL,
                 device_name TEXT NOT NULL,
                 device_path TEXT NOT NULL,
+                mount_point TEXT,
                 start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 end_time TIMESTAMP,
                 status TEXT NOT NULL,
@@ -165,12 +177,13 @@ class BackupDatabase:
         """Create a new backup session"""
         cursor = await self.db.execute("""
             INSERT INTO backup_sessions (
-                session_id, device_name, device_path, status, total_files, total_bytes
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                session_id, device_name, device_path, mount_point, status, total_files, total_bytes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
             session_info['session_id'],
             session_info['device_name'],
             session_info['device_path'],
+            session_info.get('mount_point'),
             session_info['status'],
             session_info.get('total_files', 0),
             session_info.get('total_bytes', 0)
@@ -271,6 +284,14 @@ class BackupDatabase:
         """)
         row = await cursor.fetchone()
         return dict(row) if row else {}
+
+    async def reset(self):
+        """Delete all records from files and backup_sessions tables."""
+        logger.warning("Resetting database - all backup history will be erased.")
+        await self.db.execute("DELETE FROM files")
+        await self.db.execute("DELETE FROM backup_sessions")
+        await self.db.commit()
+        logger.info("Database has been reset.")
 
 
 def calculate_file_hash(file_path: Path, chunk_size: int = 8192) -> str:

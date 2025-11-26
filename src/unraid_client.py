@@ -1,6 +1,7 @@
 """Unraid/SMB client for file backups"""
 import logging
 import shutil
+import threading
 from pathlib import Path
 from typing import Optional
 from smbprotocol.connection import Connection
@@ -36,23 +37,63 @@ class UnraidClient:
         """Initialize SMB connection"""
         try:
             if self.protocol == "smb":
-                # Register SMB session
-                await asyncio.to_thread(
-                    register_session,
-                    self.host,
-                    username=self.username,
-                    password=self.password
-                )
+                # Validate credentials
+                if not self.username or not self.password:
+                    raise ValueError("SMB username and password are required")
+                
+                if self.username == "" or self.password == "":
+                    raise ValueError("SMB username and password cannot be empty")
+                
+                # Debug: Log what credentials we're using (but mask password)
+                logger.info(f"Connecting to SMB share {self.host}/{self.share}")
+                logger.debug(f"Username: '{self.username}', Password length: {len(self.password) if self.password else 0}")
+                
+                # Register SMB session with proper authentication
+                def _register():
+                    # register_session doesn't support domain parameter
+                    # Just use username and password
+                    register_session(
+                        self.host,
+                        username=self.username,
+                        password=self.password,
+                        port=445,
+                    )
+                
+                await asyncio.to_thread(_register)
                 self._session_registered = True
                 logger.info(f"Unraid SMB client initialized for {self.host}/{self.share}")
             else:
                 logger.info(f"Unraid client using protocol: {self.protocol}")
         except Exception as e:
             logger.error(f"Failed to initialize Unraid client: {e}", exc_info=True)
+            logger.error(f"Host: {self.host}, Share: {self.share}, Username: {self.username}")
+            logger.error("Please verify:")
+            logger.error("  1. Username and password are correct")
+            logger.error("  2. User has access to the share")
+            logger.error("  3. SMB service is running on the server")
             raise
 
     async def close(self):
-        """Close connection"""
+        """Close connection and attempt to clear SMB cache in a background thread."""
+        if self.protocol == "smb" and self._session_registered:
+
+            def _clear_cache():
+                """Target for the cleanup thread."""
+                try:
+                    from smbclient import reset_connection_cache
+                    logger.info("Attempting to clear SMB connection cache in background...")
+                    # This is a blocking call
+                    reset_connection_cache()
+                    logger.info("Background SMB connection cache clearing completed.")
+                except Exception as e:
+                    # This runs in a daemon thread, so we log any errors
+                    logger.warning(f"Failed to reset SMB connection cache in background: {e}")
+
+            # Run cache clearing in a separate daemon thread.
+            # This is "best effort" and will not block shutdown if it hangs.
+            cleanup_thread = threading.Thread(target=_clear_cache, daemon=True)
+            cleanup_thread.start()
+
         logger.info("Unraid client closed")
 
     async def check_connection(self) -> bool:
@@ -95,17 +136,20 @@ class UnraidClient:
                 return None
 
             if self.protocol == "smb":
-                # Build remote path
-                smb_path = f"\\\\{self.host}\\{self.share}\\{self.path}"
+                # Build remote path using string joining to ensure consistent backslashes for UNC
+                remote_parts = [f"\\\\{self.host}\\{self.share}", self.path]
 
                 if organize_by_date and relative_path:
-                    smb_path = str(Path(smb_path) / relative_path)
+                    # Ensure the date-based path also uses backslashes
+                    remote_parts.append(relative_path.replace('/', '\\'))
+                
+                remote_dir = "\\".join(remote_parts)
 
                 # Create directories
-                await asyncio.to_thread(makedirs, smb_path, exist_ok=True)
+                await asyncio.to_thread(makedirs, remote_dir, exist_ok=True)
 
                 # Full file path
-                remote_file = str(Path(smb_path) / local_path.name)
+                remote_file = f"{remote_dir}\\{local_path.name}"
 
                 # Copy file
                 await self._copy_file_smb(local_path, remote_file)
