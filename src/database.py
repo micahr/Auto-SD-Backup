@@ -96,29 +96,61 @@ class BackupDatabase:
             logger.info("Database connection closed")
 
     async def file_exists(self, md5_hash: str, source_device: str) -> bool:
-        """Check if file with given hash already exists in database"""
+        """Check if file with given hash already exists in database and is completed"""
         cursor = await self.db.execute(
-            "SELECT id FROM files WHERE md5_hash = ? AND source_device = ?",
+            "SELECT id FROM files WHERE md5_hash = ? AND source_device = ? AND status = 'completed'",
             (md5_hash, source_device)
         )
         result = await cursor.fetchone()
         return result is not None
 
+    async def file_exists_by_metadata(self, file_name: str, file_size: int, source_device: str) -> bool:
+        """Check if file exists based on metadata (name, size, device) to avoid rehashing"""
+        # We check for 'completed' status to ensure we don't skip files that failed previously
+        cursor = await self.db.execute(
+            "SELECT id FROM files WHERE file_name = ? AND file_size = ? AND source_device = ? AND status = 'completed'",
+            (file_name, file_size, source_device)
+        )
+        result = await cursor.fetchone()
+        return result is not None
+
+    async def get_existing_files_metadata(self, source_device: str) -> set[tuple[str, int]]:
+        """
+        Get a set of (file_name, file_size) tuples for all completed backups from a device.
+        Used for bulk checking to avoid N+1 queries.
+        """
+        cursor = await self.db.execute(
+            "SELECT file_name, file_size FROM files WHERE source_device = ? AND status = 'completed'",
+            (source_device,)
+        )
+        rows = await cursor.fetchall()
+        return {(row['file_name'], row['file_size']) for row in rows}
+
     async def add_file(self, file_info: Dict[str, Any]) -> int:
-        """Add a new file to the database"""
-        cursor = await self.db.execute("""
+        """Add a new file to the database or update existing failed one"""
+        # SQLite 3.24.0+ supports ON CONFLICT DO UPDATE (UPSERT)
+        query = """
             INSERT INTO files (
                 file_path, file_name, file_size, md5_hash,
-                source_device, status, backup_date
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
+                source_device, status, backup_date, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(md5_hash, source_device) DO UPDATE SET
+                status = excluded.status,
+                file_path = excluded.file_path,
+                updated_at = CURRENT_TIMESTAMP,
+                error_message = NULL,
+                retry_count = retry_count + 1
+        """
+        
+        cursor = await self.db.execute(query, (
             file_info['file_path'],
             file_info['file_name'],
             file_info['file_size'],
             file_info['md5_hash'],
             file_info['source_device'],
             file_info['status'],
-            file_info['backup_date']
+            file_info['backup_date'],
+            file_info['created_at']
         ))
         await self.db.commit()
         return cursor.lastrowid
@@ -197,7 +229,9 @@ class BackupDatabase:
         status: Optional[str] = None,
         completed_files: Optional[int] = None,
         failed_files: Optional[int] = None,
-        transferred_bytes: Optional[int] = None
+        transferred_bytes: Optional[int] = None,
+        total_files: Optional[int] = None,
+        total_bytes: Optional[int] = None
     ):
         """Update backup session progress"""
         updates = []
@@ -220,6 +254,14 @@ class BackupDatabase:
         if transferred_bytes is not None:
             updates.append("transferred_bytes = ?")
             params.append(transferred_bytes)
+
+        if total_files is not None:
+            updates.append("total_files = ?")
+            params.append(total_files)
+
+        if total_bytes is not None:
+            updates.append("total_bytes = ?")
+            params.append(total_bytes)
 
         if not updates:
             return
@@ -294,7 +336,7 @@ class BackupDatabase:
         logger.info("Database has been reset.")
 
 
-def calculate_file_hash(file_path: Path, chunk_size: int = 8192) -> str:
+def calculate_file_hash(file_path: Path, chunk_size: int = 1024 * 1024) -> str:
     """Calculate MD5 hash of a file"""
     md5 = hashlib.md5()
     with open(file_path, 'rb') as f:

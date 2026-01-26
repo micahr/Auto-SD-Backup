@@ -221,6 +221,22 @@ class MQTTClient:
             retain=True
         )
 
+        # Sensor for last backup time
+        last_backup_config = {
+            "name": "SnapSync Last Backup",
+            "unique_id": "snapsync_last_backup",
+            "state_topic": f"{self.config.topic_prefix}/last_backup",
+            "device": device_info,
+            "device_class": "timestamp",
+            "icon": "mdi:clock-check-outline"
+        }
+
+        await self._publish(
+            f"{self.config.discovery_prefix}/sensor/snapsync/last_backup/config",
+            json.dumps(last_backup_config),
+            retain=True
+        )
+
         logger.info("Sent Home Assistant discovery messages")
 
     async def _publish(self, topic: str, payload: str, retain: bool = False):
@@ -252,7 +268,10 @@ class MQTTClient:
         total: int,
         current_file: Optional[str] = None,
         bytes_transferred: int = 0,
-        total_bytes: int = 0
+        total_bytes: int = 0,
+        elapsed_seconds: float = 0,
+        remaining_seconds: float = 0,
+        current_speed: float = 0
     ):
         """Publish backup progress information"""
         if total > 0:
@@ -265,7 +284,10 @@ class MQTTClient:
             "completed_files": completed,
             "total_files": total,
             "bytes_transferred": bytes_transferred,
-            "total_bytes": total_bytes
+            "total_bytes": total_bytes,
+            "elapsed_seconds": round(elapsed_seconds, 1),
+            "remaining_seconds": round(remaining_seconds, 1),
+            "current_speed_mbps": round(current_speed / (1024 * 1024), 2)  # MB/s
         }
 
         await self._publish(
@@ -318,6 +340,16 @@ class MQTTClient:
         await self._publish(
             f"{self.config.topic_prefix}/last_session",
             json.dumps(summary),
+            retain=True
+        )
+
+        # Publish timestamp (ISO 8601 format for HA)
+        from datetime import datetime, timezone
+        current_time = datetime.now(timezone.utc).isoformat()
+        
+        await self._publish(
+            f"{self.config.topic_prefix}/last_backup",
+            current_time,
             retain=True
         )
 

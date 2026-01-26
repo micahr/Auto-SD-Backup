@@ -23,7 +23,7 @@ class ServiceManager:
 
     def __init__(self, config: Config):
         self.config = config
-        self.database: Optional[BackupDatabase] = None
+        self.database = BackupDatabase(self.config.service.database_path)
         self.sd_detector: Optional[SDCardDetector] = None
         self.immich_client: Optional[ImmichClient] = None
         self.unraid_client: Optional[UnraidClient] = None
@@ -34,6 +34,7 @@ class ServiceManager:
         self._web_server: Optional[uvicorn.Server] = None
         self._pending_backups: dict[str, SDCard] = {}  # Pending approval backups
         self._auto_backup_enabled = True  # Runtime toggle
+        self._current_progress: dict = {} # Store current progress metrics
         self._detector_task = None
         self._web_server_task = None
 
@@ -50,6 +51,7 @@ class ServiceManager:
 
             # Reduce log level for smbprotocol to avoid excessive logging
             logging.getLogger('smbprotocol').setLevel(logging.WARNING)
+            logging.getLogger('aiosqlite').setLevel(logging.WARNING)
 
             # Configure separate log for HTTP traffic if specified
             if self.config.service.http_log_path:
@@ -68,8 +70,21 @@ class ServiceManager:
                 logger.info(f"Redirecting HTTP logs to {self.config.service.http_log_path}")
 
             # Initialize database
-            self.database = BackupDatabase(self.config.service.database_path)
             await self.database.initialize()
+
+            # Clean up interrupted sessions from previous runs
+            try:
+                await self.database.db.execute(
+                    "UPDATE backup_sessions SET status = 'failed', end_time = CURRENT_TIMESTAMP "
+                    "WHERE status IN ('scanning', 'backing_up')"
+                )
+                await self.database.db.execute(
+                    "UPDATE files SET status = 'failed', error_message = 'Interrupted by service restart' "
+                    "WHERE status = 'backing_up'"
+                )
+                await self.database.db.commit()
+            except Exception as e:
+                logger.warning(f"Failed to clean up stale sessions: {e}")
 
             # Initialize Immich client if enabled
             if self.config.immich.enabled:
@@ -112,7 +127,8 @@ class ServiceManager:
                 self.database,
                 self.immich_client,
                 self.unraid_client,
-                progress_callback=self._on_backup_progress
+                progress_callback=self._on_backup_progress,
+                scanning_callback=self._on_scanning_progress
             )
 
             # Initialize SD card detector (auto-detects platform)
@@ -288,12 +304,33 @@ class ServiceManager:
         # Note: We don't stop the backup if it's in progress
         # The backup engine will handle files that are no longer accessible
 
+    async def _on_scanning_progress(self, session_id: str, count: int, total: int, filename: str):
+        """Handle scanning progress updates"""
+        # Log less frequently to keep logs clean
+        if count % 50 == 0:
+            logger.info(f"Scanning progress: {count}/{total} files (hashing {filename})")
+        
+        # Update status and MQTT every 5 files to reduce overhead
+        if count % 5 == 0 or count == total:
+            if total > 0:
+                status_msg = f"scanning ({count}/{total} files)"
+            else:
+                status_msg = f"scanning ({count} files)"
+            
+            self._current_status = status_msg
+            
+            if self.mqtt_client:
+                await self.mqtt_client.publish_status(status_msg)
+
     async def _on_backup_progress(
         self,
         session_id: str,
         completed: int,
         failed: int,
-        total: int
+        total: int,
+        elapsed_seconds: float = 0,
+        remaining_seconds: float = 0,
+        current_speed: float = 0
     ):
         """Handle backup progress updates"""
         logger.info(f"Backup progress: {completed}/{total} files ({failed} failed)")
@@ -301,12 +338,22 @@ class ServiceManager:
         # Get session info
         session = await self.database.get_session(session_id)
 
+        # Update local progress state
+        self._current_progress = {
+            "elapsed_seconds": elapsed_seconds,
+            "remaining_seconds": remaining_seconds,
+            "current_speed": current_speed
+        }
+
         if self.mqtt_client:
             await self.mqtt_client.publish_progress(
                 completed=completed,
                 total=total,
                 bytes_transferred=session.get('transferred_bytes', 0) if session else 0,
-                total_bytes=session.get('total_bytes', 0) if session else 0
+                total_bytes=session.get('total_bytes', 0) if session else 0,
+                elapsed_seconds=elapsed_seconds,
+                remaining_seconds=remaining_seconds,
+                current_speed=current_speed
             )
 
         # Check if backup is complete
@@ -319,14 +366,15 @@ class ServiceManager:
                 await self.mqtt_client.publish_session_complete(session or {})
                 await self.mqtt_client.publish_status("completed")
 
-            # Auto-eject if enabled and successful
-            if self.config.backup.auto_eject and failed == 0 and session and session.get('mount_point'):
+            # Auto-eject if enabled (regardless of success/failure)
+            if self.config.backup.auto_eject and session and session.get('mount_point'):
                 logger.info(f"Auto-ejecting {session['mount_point']}...")
                 await eject_device(session['mount_point'])
 
             # Return to idle after a short delay
             await asyncio.sleep(5)
             self._current_status = "idle"
+            self._current_progress = {}
 
             if self.mqtt_client:
                 await self.mqtt_client.publish_status("idle")
@@ -338,6 +386,7 @@ class ServiceManager:
         return {
             "status": self._current_status,
             "current_session": active_session,
+            "progress": self._current_progress,
             "immich_enabled": self.config.immich.enabled,
             "unraid_enabled": self.config.unraid.enabled,
             "mqtt_enabled": self.config.mqtt.enabled,

@@ -1,6 +1,7 @@
 """Backup engine for orchestrating file backups"""
 import asyncio
 import logging
+import time
 from pathlib import Path
 from typing import Optional, List, Callable
 from datetime import datetime
@@ -24,13 +25,15 @@ class BackupEngine:
         database: BackupDatabase,
         immich_client: Optional[ImmichClient] = None,
         unraid_client: Optional[UnraidClient] = None,
-        progress_callback: Optional[Callable] = None
+        progress_callback: Optional[Callable] = None,
+        scanning_callback: Optional[Callable] = None
     ):
         self.config = config
         self.database = database
         self.immich_client = immich_client
         self.unraid_client = unraid_client
         self.progress_callback = progress_callback
+        self.scanning_callback = scanning_callback
         self._current_session_id: Optional[str] = None
         self._semaphore = asyncio.Semaphore(config.backup.concurrent_files)
 
@@ -47,35 +50,41 @@ class BackupEngine:
         logger.info(f"Starting backup session {session_id} for {sd_card.device_name}")
 
         try:
-            # Scan SD card for files
-            files_to_backup = await self._scan_sd_card(sd_card)
-
-            if not files_to_backup:
-                logger.info("No new files to backup")
-                await self.database.create_session({
-                    'session_id': session_id,
-                    'device_name': sd_card.device_name,
-                    'device_path': sd_card.device_path,
-                    'status': 'completed',
-                    'total_files': 0,
-                    'total_bytes': 0
-                })
-                return session_id
-
-            # Calculate totals
-            total_files = len(files_to_backup)
-            total_bytes = sum(f['file_size'] for f in files_to_backup)
-
-            # Create backup session
+            # Create initial session with 'scanning' status
             await self.database.create_session({
                 'session_id': session_id,
                 'device_name': sd_card.device_name,
                 'device_path': sd_card.device_path,
                 'mount_point': sd_card.mount_point,
-                'status': 'backing_up',
-                'total_files': total_files,
-                'total_bytes': total_bytes
+                'status': 'scanning',
+                'total_files': 0,
+                'total_bytes': 0
             })
+
+            # Scan SD card for files
+            files_to_backup = await self._scan_sd_card(sd_card, session_id)
+
+            # Calculate totals
+            total_files = len(files_to_backup)
+            total_bytes = sum(f['file_size'] for f in files_to_backup)
+
+            if not files_to_backup:
+                logger.info("No new files to backup")
+                await self.database.update_session(
+                    session_id,
+                    status='completed',
+                    total_files=0,
+                    total_bytes=0
+                )
+                return session_id
+
+            # Update session with totals and change status to backing_up
+            await self.database.update_session(
+                session_id,
+                status='backing_up',
+                total_files=total_files,
+                total_bytes=total_bytes
+            )
 
             logger.info(f"Found {total_files} files to backup ({total_bytes} bytes)")
 
@@ -89,7 +98,7 @@ class BackupEngine:
             await self.database.update_session(session_id, status='failed')
             raise
 
-    async def _scan_sd_card(self, sd_card: SDCard) -> List[dict]:
+    async def _scan_sd_card(self, sd_card: SDCard, session_id: str) -> List[dict]:
         """
         Scan SD card for files to backup
 
@@ -98,8 +107,26 @@ class BackupEngine:
         """
         files_to_backup = []
         mount_point = Path(sd_card.mount_point)
+        scanned_count = 0
 
         logger.info(f"Scanning {mount_point} for files...")
+
+        # Pre-load existing files metadata to avoid N+1 DB queries
+        try:
+            existing_files = await self.database.get_existing_files_metadata(sd_card.device_id)
+            logger.info(f"Loaded {len(existing_files)} existing file records for fast lookup")
+        except Exception as e:
+            logger.error(f"Failed to load existing files metadata: {e}")
+            existing_files = set()
+
+        # Pre-count files for progress tracking
+        try:
+            # Only count regular files
+            total_files_count = sum(1 for _ in mount_point.rglob('*') if _.is_file())
+            logger.info(f"Found {total_files_count} total files to process")
+        except Exception as e:
+            logger.warning(f"Could not pre-count files: {e}")
+            total_files_count = 0
 
         try:
             # Walk through all files on SD card
@@ -109,11 +136,26 @@ class BackupEngine:
 
                 # Check file extension
                 if not self._should_backup_file(file_path):
+                    # Still count skipped files towards progress to keep total accurate
+                    scanned_count += 1
+                    if self.scanning_callback and scanned_count % 5 == 0:
+                         await self.scanning_callback(session_id, scanned_count, total_files_count, "Skipping...")
                     continue
 
                 # Check file size
                 file_size = file_path.stat().st_size
                 if file_size < self.config.files.min_size:
+                    scanned_count += 1
+                    continue
+
+                # Report scanning progress
+                scanned_count += 1
+                if self.scanning_callback:
+                    await self.scanning_callback(session_id, scanned_count, total_files_count, str(file_path.name))
+
+                # Optimization: Check if file already exists by metadata (in-memory) to avoid hashing
+                if (file_path.name, file_size) in existing_files:
+                    logger.debug(f"File {file_path.name} already backed up (metadata match), skipping hash")
                     continue
 
                 # Calculate hash
@@ -121,7 +163,7 @@ class BackupEngine:
                 file_hash = await asyncio.to_thread(calculate_file_hash, file_path)
 
                 # Check if file already backed up
-                if await self.database.file_exists(file_hash, sd_card.device_name):
+                if await self.database.file_exists(file_hash, sd_card.device_id):
                     logger.debug(f"File {file_path.name} already backed up, skipping")
                     continue
 
@@ -134,7 +176,7 @@ class BackupEngine:
                     'file_name': file_path.name,
                     'file_size': file_size,
                     'md5_hash': file_hash,
-                    'source_device': sd_card.device_name,
+                    'source_device': sd_card.device_id,
                     'status': 'new',
                     'backup_date': backup_date,
                     'created_at': file_mtime
@@ -155,6 +197,8 @@ class BackupEngine:
         completed = 0
         failed = 0
         transferred_bytes = 0
+        total_bytes = sum(f['file_size'] for f in files)
+        start_time = time.time()
 
         try:
             # Process files with concurrency limit
@@ -181,9 +225,28 @@ class BackupEngine:
                     transferred_bytes=transferred_bytes
                 )
 
+                # Calculate progress metrics
+                elapsed_seconds = time.time() - start_time
+                remaining_seconds = 0
+                current_speed = 0
+
+                if transferred_bytes > 0 and elapsed_seconds > 0:
+                    current_speed = transferred_bytes / elapsed_seconds  # bytes per second
+                    remaining_bytes = total_bytes - transferred_bytes
+                    if current_speed > 0:
+                        remaining_seconds = remaining_bytes / current_speed
+
                 # Call progress callback
                 if self.progress_callback:
-                    await self.progress_callback(session_id, completed, failed, len(files))
+                    await self.progress_callback(
+                        session_id,
+                        completed,
+                        failed,
+                        len(files),
+                        elapsed_seconds=elapsed_seconds,
+                        remaining_seconds=remaining_seconds,
+                        current_speed=current_speed
+                    )
 
             # Mark session as completed
             final_status = 'completed' if failed == 0 else 'completed_with_errors'
