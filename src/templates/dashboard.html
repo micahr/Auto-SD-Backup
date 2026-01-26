@@ -605,6 +605,12 @@
         }
 
         function formatDate(dateString) {
+            if (!dateString) return '-';
+            // SQLite returns UTC 'YYYY-MM-DD HH:MM:SS' without Z
+            // We append Z to force JS to treat it as UTC, then convert to local
+            if (typeof dateString === 'string' && dateString.match(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/)) {
+                dateString += 'Z';
+            }
             const date = new Date(dateString);
             return date.toLocaleString();
         }
