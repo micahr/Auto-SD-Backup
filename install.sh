@@ -10,6 +10,15 @@ echo "  SnapSync Installation Script"
 echo "========================================="
 echo ""
 
+# Parse arguments
+UPDATE_MODE="false"
+for arg in "$@"; do
+    if [ "$arg" == "--update" ] || [ "$arg" == "-u" ]; then
+        UPDATE_MODE="true"
+        echo "Update mode enabled: Skipping system dependencies installation."
+    fi
+done
+
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then
     echo "Please run as root (use sudo)"
@@ -48,20 +57,30 @@ if ! python3 -c 'import sys; exit(0 if sys.version_info >= (3, 9) else 1)'; then
 fi
 
 # Install system dependencies
-echo ""
-echo "Installing system dependencies..."
-apt-get update
-apt-get install -y python3-pip python3-venv libudev-dev exfatprogs
+if [ "$UPDATE_MODE" != "true" ]; then
+    echo ""
+    echo "Installing system dependencies..."
+    apt-get update
+    apt-get install -y python3-pip python3-venv libudev-dev exfatprogs
+else
+    echo "Skipping system dependencies (update mode)"
+fi
 
 # Create virtual environment
 echo ""
-echo "Creating Python virtual environment..."
-cd "$INSTALL_DIR"
-sudo -u "$INSTALL_USER" python3 -m venv venv
+if [ ! -d "venv" ]; then
+    echo "Creating Python virtual environment..."
+    cd "$INSTALL_DIR"
+    sudo -u "$INSTALL_USER" python3 -m venv venv
+else
+    echo "Using existing virtual environment."
+fi
 
 # Install Python dependencies
 echo "Installing Python dependencies..."
-sudo -u "$INSTALL_USER" "$INSTALL_DIR/venv/bin/pip" install --upgrade pip
+if [ "$UPDATE_MODE" != "true" ]; then
+    sudo -u "$INSTALL_USER" "$INSTALL_DIR/venv/bin/pip" install --upgrade pip
+fi
 sudo -u "$INSTALL_USER" "$INSTALL_DIR/venv/bin/pip" install -r requirements.txt
 
 # Create config from template if it doesn't exist
