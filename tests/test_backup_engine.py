@@ -17,7 +17,7 @@ from unittest.mock import Mock, AsyncMock, patch
 from datetime import datetime
 
 from src.backup_engine import BackupEngine
-from src.sd_detector import SDCard
+from src.sd_detector_cross_platform import SDCard
 
 
 @pytest.fixture
@@ -27,8 +27,9 @@ def sd_card(tmp_path):
         device_name="TEST_SD_CARD",
         device_path="/dev/sdc1",
         mount_point=str(tmp_path),
-        size_bytes=32000000000,
-        label="TEST_CARD"
+        size=32000000000,
+        label="TEST_CARD",
+        device_id="TEST_DEVICE_UUID"
     )
 
 
@@ -84,7 +85,7 @@ class TestFileScanning:
     @pytest.mark.asyncio
     async def test_scan_sd_card_empty(self, backup_engine, sd_card):
         """Test scanning an empty SD card."""
-        files = await backup_engine._scan_sd_card(sd_card)
+        files = await backup_engine._scan_sd_card(sd_card, 'test_session')
         assert files == []
 
     @pytest.mark.asyncio
@@ -94,7 +95,7 @@ class TestFileScanning:
         (tmp_path / "IMG_001.jpg").write_bytes(b"test image content" * 100)
         (tmp_path / "VID_001.mp4").write_bytes(b"test video content" * 200)
 
-        files = await backup_engine._scan_sd_card(sd_card)
+        files = await backup_engine._scan_sd_card(sd_card, 'test_session')
 
         assert len(files) == 2
         assert any(f['file_name'] == 'IMG_001.jpg' for f in files)
@@ -108,7 +109,7 @@ class TestFileScanning:
         (tmp_path / "invalid.txt").write_bytes(b"invalid" * 1000)
         (tmp_path / "document.pdf").write_bytes(b"pdf" * 1000)
 
-        files = await backup_engine._scan_sd_card(sd_card)
+        files = await backup_engine._scan_sd_card(sd_card, 'test_session')
 
         # Only .jpg should be included
         assert len(files) == 1
@@ -121,7 +122,7 @@ class TestFileScanning:
         (tmp_path / "large.jpg").write_bytes(b"x" * 10000)  # Larger than min_size
         (tmp_path / "tiny.jpg").write_bytes(b"x" * 100)     # Smaller than min_size
 
-        files = await backup_engine._scan_sd_card(sd_card)
+        files = await backup_engine._scan_sd_card(sd_card, 'test_session')
 
         # Only large file should be included
         assert len(files) == 1
@@ -137,7 +138,7 @@ class TestFileScanning:
         (dcim_dir / "IMG_001.jpg").write_bytes(b"test" * 1000)
         (dcim_dir / "IMG_002.jpg").write_bytes(b"test" * 1000)
 
-        files = await backup_engine._scan_sd_card(sd_card)
+        files = await backup_engine._scan_sd_card(sd_card, 'test_session')
 
         assert len(files) == 2
 
@@ -147,7 +148,7 @@ class TestFileScanning:
         test_file = tmp_path / "test.jpg"
         test_file.write_bytes(b"test content" * 100)
 
-        files = await backup_engine._scan_sd_card(sd_card)
+        files = await backup_engine._scan_sd_card(sd_card, 'test_session')
 
         assert len(files) == 1
         assert 'md5_hash' in files[0]
@@ -162,7 +163,7 @@ class TestFileScanning:
         test_file.write_bytes(content)
 
         # First scan should find the file
-        files = await backup_engine._scan_sd_card(sd_card)
+        files = await backup_engine._scan_sd_card(sd_card, 'test_session')
         assert len(files) == 1
 
         # Add file to database (simulate it was backed up)
@@ -170,7 +171,7 @@ class TestFileScanning:
         await test_db.add_file(file_info)
 
         # Second scan should skip the file
-        files = await backup_engine._scan_sd_card(sd_card)
+        files = await backup_engine._scan_sd_card(sd_card, 'test_session')
         assert len(files) == 0
 
     @pytest.mark.asyncio
@@ -179,7 +180,7 @@ class TestFileScanning:
         test_file = tmp_path / "test.jpg"
         test_file.write_bytes(b"test" * 1000)
 
-        files = await backup_engine._scan_sd_card(sd_card)
+        files = await backup_engine._scan_sd_card(sd_card, 'test_session')
 
         assert len(files) == 1
         assert 'backup_date' in files[0]

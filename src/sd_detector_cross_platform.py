@@ -17,6 +17,7 @@ class SDCard:
     device_path: str
     size: int = 0
     label: Optional[str] = None
+    device_id: Optional[str] = None
 
 
 # Try to import platform-specific modules
@@ -49,15 +50,48 @@ class LinuxSDCardDetector:
         self.on_remove = on_remove
         self._running = False
         self._mounted_cards: dict[str, SDCard] = {}
-
-    def _is_removable_device(self, device) -> bool:
-        """Check if device is removable storage"""
+        # Capture the running loop for thread-safe scheduling
         try:
+            self.loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Fallback if initialized outside of a running loop (unlikely in this app structure)
+            self.loop = asyncio.new_event_loop()
+
+    def _check_removable(self, device) -> bool:
+        """
+        Check if device is removable storage using multiple heuristics.
+        Returns True if device appears to be a removable SD card/USB drive.
+        """
+        try:
+            # 1. Check sysfs 'removable' flag
             removable_path = Path(f"/sys/block/{device.sys_name}/removable")
             if removable_path.exists():
                 with open(removable_path, 'r') as f:
                     if f.read().strip() == '1':
                         return True
+
+            # 2. Check udev properties commonly associated with SD cards/USB
+            if device.get('ID_DRIVE_FLASH_SD') == '1':
+                return True
+            if device.get('ID_BUS') == 'mmc':
+                return True
+            
+            # 3. Check parent device if this is a partition (e.g., sdb1 -> sdb)
+            if device.parent:
+                parent = device.parent
+                # Check parent's sysfs flag
+                parent_removable = Path(f"/sys/block/{parent.sys_name}/removable")
+                if parent_removable.exists():
+                    with open(parent_removable, 'r') as f:
+                        if f.read().strip() == '1':
+                            return True
+                
+                # Check parent's udev properties
+                if parent.get('ID_DRIVE_FLASH_SD') == '1':
+                    return True
+                if parent.get('ID_BUS') == 'mmc':
+                    return True
+
             return False
         except Exception as e:
             logger.debug(f"Error checking if device {device.sys_name} is removable: {e}")
@@ -94,24 +128,45 @@ class LinuxSDCardDetector:
         except:
             return 0
 
-    async def _handle_device_event(self, device, action: str):
+    async def _handle_device_event(self, device, action):
         """Handle device add/remove events"""
         try:
-            if action == 'add' and self._is_removable_device(device):
-                await asyncio.sleep(1)
-                mount_point = self._get_mount_point(device)
-                if mount_point:
-                    sd_card = SDCard(
-                        device_name=device.sys_name,
-                        mount_point=mount_point,
-                        device_path=device.device_node,
-                        size=self._get_device_size(device),
-                        label=self._get_device_label(device)
-                    )
-                    self._mounted_cards[device.sys_name] = sd_card
-                    logger.info(f"SD card detected: {sd_card.device_name} at {sd_card.mount_point}")
-                    if self.on_insert:
-                        await self.on_insert(sd_card)
+            logger.debug(f"Handling device event: action={action}, device={getattr(device, 'sys_name', 'unknown')}")
+            
+            if action == 'add':
+                is_removable = self._check_removable(device)
+                logger.debug(f"Device {getattr(device, 'sys_name', 'unknown')} removable: {is_removable}")
+                
+                if is_removable:
+                    logger.debug("Waiting for mount...")
+                    
+                    # Retry loop for slow auto-mounters
+                    mount_point = None
+                    for i in range(5):
+                        mount_point = self._get_mount_point(device)
+                        if mount_point:
+                            break
+                        await asyncio.sleep(1)
+                        logger.debug(f"Retry {i+1}/5: Waiting for mount point...")
+
+                    logger.debug(f"Mount point for {getattr(device, 'device_node', 'unknown')}: {mount_point}")
+                    
+                    if mount_point:
+                        sd_card = SDCard(
+                            device_name=device.sys_name,
+                            mount_point=mount_point,
+                            device_path=device.device_node,
+                            size=self._get_device_size(device),
+                            label=self._get_device_label(device),
+                            device_id=device.get('ID_FS_UUID') or device.get('ID_SERIAL') or device.sys_name
+                        )
+                        self._mounted_cards[device.sys_name] = sd_card
+                        logger.info(f"SD card detected: {sd_card.device_name} at {sd_card.mount_point}")
+                        if self.on_insert:
+                            await self.on_insert(sd_card)
+                    else:
+                        logger.warning(f"Device {getattr(device, 'sys_name', 'unknown')} ({getattr(device, 'device_node', 'unknown')}) detected but not mounted after 5 seconds.")
+                        logger.warning("Please ensure your OS has auto-mounting enabled (e.g., usbmount, udisks2).")
             elif action == 'remove':
                 if device.sys_name in self._mounted_cards:
                     sd_card = self._mounted_cards.pop(device.sys_name)
@@ -137,16 +192,21 @@ class LinuxSDCardDetector:
 
     def _device_event_callback(self, device):
         """Callback for pyudev monitor"""
-        action = device.action
-        if self._running:
-            asyncio.create_task(self._handle_device_event(device, action))
+        try:
+            if self._running:
+                asyncio.run_coroutine_threadsafe(
+                    self._handle_device_event(device, device.action),
+                    self.loop
+                )
+        except Exception as e:
+            logger.error(f"Error in pyudev callback: {e}")
 
     async def _scan_existing_devices(self):
         """Scan for already mounted removable devices"""
         logger.info("Scanning for existing removable devices...")
         try:
             for device in self.context.list_devices(subsystem='block', DEVTYPE='partition'):
-                if self._is_removable_device(device):
+                if self._check_removable(device):
                     await self._handle_device_event(device, 'add')
         except Exception as e:
             logger.error(f"Error scanning existing devices: {e}", exc_info=True)
@@ -268,9 +328,10 @@ class MacOSSDCardDetector:
         """Handle new volume detected"""
         try:
             # Get volume size and info using non-blocking async calls
-            size, disk_info = await asyncio.gather(
+            size, disk_info, uuid = await asyncio.gather(
                 self._get_volume_size(volume_path),
-                self._get_disk_info(volume_name)
+                self._get_disk_info(volume_name),
+                self._get_volume_uuid(volume_name)
             )
 
             sd_card = SDCard(
@@ -278,7 +339,8 @@ class MacOSSDCardDetector:
                 mount_point=str(volume_path),
                 device_path=str(volume_path),
                 size=size,
-                label=volume_name
+                label=volume_name,
+                device_id=uuid or volume_name  # Fallback to volume name if UUID not found
             )
 
             self._mounted_cards[volume_name] = sd_card
@@ -287,6 +349,8 @@ class MacOSSDCardDetector:
             logger.info(f"  Mount point: {volume_path}")
             if disk_info:
                 logger.info(f"  Type: {disk_info}")
+            if uuid:
+                logger.info(f"  UUID: {uuid}")
             if size > 0:
                 logger.info(f"  Size: {self._format_size(size)}")
 
@@ -331,6 +395,34 @@ class MacOSSDCardDetector:
         except Exception:
             pass
         return 0
+
+    async def _get_volume_uuid(self, volume_name: str) -> Optional[str]:
+        """Get volume UUID using diskutil asynchronously"""
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                'diskutil', 'info', f'/Volumes/{volume_name}',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+
+            if proc.returncode == 0 and stdout:
+                output = stdout.decode()
+                for line in output.split('\n'):
+                    if 'Volume UUID:' in line:
+                        return line.split(':', 1)[1].strip()
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            if proc:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            if isinstance(Exception, asyncio.CancelledError):
+                raise
+        except Exception:
+            pass
+        return None
 
     async def _get_disk_info(self, volume_name: str) -> Optional[str]:
         """Get disk type info using diskutil asynchronously"""
@@ -412,7 +504,8 @@ class DevSimulator:
             mount_point=str(path_obj),
             device_path=str(path_obj),
             size=self._get_dir_size(path_obj),
-            label=path_obj.name
+            label=path_obj.name,
+            device_id=path_obj.name
         )
 
         self._mounted_cards[path_obj.name] = sd_card

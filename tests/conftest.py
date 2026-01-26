@@ -191,7 +191,7 @@ def mock_immich_client():
     """Create a mock Immich client."""
     client = AsyncMock()
     client.check_connection = AsyncMock(return_value=True)
-    client.upload_asset = AsyncMock(return_value="test-asset-id-123")
+    client.upload_asset = AsyncMock(return_value={'id': "test-asset-id-123"})
     client.verify_asset = AsyncMock(return_value=True)
     client.get_asset_info = AsyncMock(return_value={
         'id': 'test-asset-id-123',

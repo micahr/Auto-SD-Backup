@@ -51,7 +51,7 @@ fi
 echo ""
 echo "Installing system dependencies..."
 apt-get update
-apt-get install -y python3-pip python3-venv libudev-dev
+apt-get install -y python3-pip python3-venv libudev-dev exfatprogs
 
 # Create virtual environment
 echo ""
@@ -89,6 +89,24 @@ sed -e "s|User=pi|User=$INSTALL_USER|g" \
 
 # Reload systemd
 systemctl daemon-reload
+
+# Enable service to start on boot
+echo "Enabling service..."
+systemctl enable snapsync
+
+# Setup auto-mounting via udev
+echo ""
+echo "Setting up auto-mounting rules..."
+cat > /etc/udev/rules.d/99-snapsync-automount.rules << EOF
+# Auto-mount USB drives (partitions)
+KERNEL=="sd[a-z][0-9]", ACTION=="add", RUN+="/usr/bin/systemd-mount --no-block --automount=no --collect \$devnode"
+# Auto-mount SD cards (MMC partitions)
+KERNEL=="mmcblk[0-9]p[0-9]", ACTION=="add", RUN+="/usr/bin/systemd-mount --no-block --automount=no --collect \$devnode"
+EOF
+
+# Reload udev rules
+udevadm control --reload-rules
+udevadm trigger
 
 # Create symlink for CLI
 echo ""
