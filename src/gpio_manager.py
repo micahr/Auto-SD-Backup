@@ -1,17 +1,13 @@
 """GPIO Manager for status LEDs on Raspberry Pi"""
 import logging
 import asyncio
-import platform
 
 logger = logging.getLogger(__name__)
 
 # Mock GPIO if not on Raspberry Pi or library missing
 try:
-    if platform.system() == "Linux" and platform.machine() in ["aarch64", "armv7l"]:
-        import RPi.GPIO as GPIO
-        HAS_GPIO = True
-    else:
-        raise ImportError("Not on Raspberry Pi")
+    import RPi.GPIO as GPIO
+    HAS_GPIO = True
 except (ImportError, RuntimeError):
     HAS_GPIO = False
     class GPIO:
