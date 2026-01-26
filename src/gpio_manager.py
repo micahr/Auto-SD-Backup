@@ -12,7 +12,7 @@ try:
         HAS_GPIO = True
     else:
         raise ImportError("Not on Raspberry Pi")
-except ImportError:
+except (ImportError, RuntimeError):
     HAS_GPIO = False
     class GPIO:
         BCM = 'BCM'
