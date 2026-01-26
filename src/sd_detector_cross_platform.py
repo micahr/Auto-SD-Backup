@@ -190,12 +190,12 @@ class LinuxSDCardDetector:
             observer.stop()
             logger.info("SD card detector stopped")
 
-    def _device_event_callback(self, device):
+    def _device_event_callback(self, action, device):
         """Callback for pyudev monitor"""
         try:
             if self._running:
                 asyncio.run_coroutine_threadsafe(
-                    self._handle_device_event(device, device.action),
+                    self._handle_device_event(device, action),
                     self.loop
                 )
         except Exception as e:
