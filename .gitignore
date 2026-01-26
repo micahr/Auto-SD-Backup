@@ -8,6 +8,16 @@ venv/
 # Python
 __pycache__/
 *.pyc
+*.egg-info/
 
 # Local deployment artifacts
 dist/
+
+# Logs
+*.log
+
+# Testing coverage
+coverage.xml
+
+# Editor/Agent
+.gemini/
