@@ -79,25 +79,33 @@ class UnraidClient:
 
             def _clear_cache():
                 """Target for the cleanup thread."""
-                # Suppress smbclient noise during disconnect
-                smb_pool_logger = logging.getLogger("smbclient._pool")
-                original_level = smb_pool_logger.level
+                # Loggers to suppress during disconnect
+                # smbprotocol logs connection errors, smbclient logs warnings
+                loggers_to_suppress = ["smbclient", "smbprotocol"]
+                original_levels = {}
 
                 try:
-                    from smbclient import reset_connection_cache
+                    # Suppress logs aggressively to avoid noise on shutdown
+                    for name in loggers_to_suppress:
+                        logger_obj = logging.getLogger(name)
+                        original_levels[name] = logger_obj.level
+                        logger_obj.setLevel(logging.CRITICAL)
 
-                    # Temporarily set to ERROR to hide WARNING logs + tracebacks
-                    smb_pool_logger.setLevel(logging.ERROR)
+                    from smbclient import reset_connection_cache
 
                     logger.info("Attempting to clear SMB connection cache in background...")
                     # This is a blocking call
                     reset_connection_cache()
                     logger.info("Background SMB connection cache clearing completed.")
                 except Exception as e:
-                    # This runs in a daemon thread, so we log any errors
-                    logger.warning(f"Failed to reset SMB connection cache in background: {e}")
+                    # Filter out expected shutdown noise
+                    msg = str(e)
+                    if "Failed to find session" not in msg and "socket is closed" not in msg:
+                        logger.warning(f"Failed to reset SMB connection cache in background: {e}")
                 finally:
-                    smb_pool_logger.setLevel(original_level)
+                    # Restore levels
+                    for name, level in original_levels.items():
+                        logging.getLogger(name).setLevel(level)
 
             # Run cache clearing in a separate daemon thread.
             # This is "best effort" and will not block shutdown if it hangs.
