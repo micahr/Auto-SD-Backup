@@ -96,6 +96,7 @@ class BackupConfig:
     require_approval: bool = False
     auto_backup_enabled: bool = True
     auto_eject: bool = False
+    hash_algorithm: str = "md5"  # md5 or xxhash
 
     @staticmethod
     def from_dict(data: dict) -> 'BackupConfig':
@@ -107,7 +108,8 @@ class BackupConfig:
             retry_delay=data.get('retry_delay', 5),
             require_approval=data.get('require_approval', False),
             auto_backup_enabled=data.get('auto_backup_enabled', True),
-            auto_eject=data.get('auto_eject', False)
+            auto_eject=data.get('auto_eject', False),
+            hash_algorithm=data.get('hash_algorithm', 'md5')
         )
 
 
@@ -310,6 +312,7 @@ class Config:
                 'retry_delay': self.backup.retry_delay,
                 'require_approval': self.backup.require_approval,
                 'auto_backup_enabled': self.backup.auto_backup_enabled,
+                'hash_algorithm': self.backup.hash_algorithm,
             }
         }
 

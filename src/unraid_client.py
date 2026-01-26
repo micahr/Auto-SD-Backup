@@ -79,8 +79,16 @@ class UnraidClient:
 
             def _clear_cache():
                 """Target for the cleanup thread."""
+                # Suppress smbclient noise during disconnect
+                smb_pool_logger = logging.getLogger("smbclient._pool")
+                original_level = smb_pool_logger.level
+
                 try:
                     from smbclient import reset_connection_cache
+
+                    # Temporarily set to ERROR to hide WARNING logs + tracebacks
+                    smb_pool_logger.setLevel(logging.ERROR)
+
                     logger.info("Attempting to clear SMB connection cache in background...")
                     # This is a blocking call
                     reset_connection_cache()
@@ -88,6 +96,8 @@ class UnraidClient:
                 except Exception as e:
                     # This runs in a daemon thread, so we log any errors
                     logger.warning(f"Failed to reset SMB connection cache in background: {e}")
+                finally:
+                    smb_pool_logger.setLevel(original_level)
 
             # Run cache clearing in a separate daemon thread.
             # This is "best effort" and will not block shutdown if it hangs.
@@ -208,3 +218,28 @@ class UnraidClient:
         except Exception as e:
             logger.error(f"Error verifying file {remote_path}: {e}")
             return False
+
+    async def check_space(self, required_bytes: int) -> bool:
+        """Check if destination has enough space"""
+        try:
+            check_path = self.path
+            
+            # If we have a mount point configured (for NFS/Local/Mounted SMB), check that
+            if self.protocol in ["nfs", "local"] or (self.protocol == "smb" and self.mount_point):
+                 if self.mount_point:
+                     check_path = self.mount_point
+                 
+                 if not Path(check_path).exists():
+                     return True # Cannot check if path doesn't exist locally
+
+                 total, used, free = shutil.disk_usage(check_path)
+                 if free < required_bytes:
+                     logger.error(f"Not enough space on {check_path}. Required: {required_bytes}, Free: {free}")
+                     return False
+                 return True
+                 
+            # For pure SMB without mount point, assume True (checking quota is complex)
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to check disk space: {e}")
+            return True

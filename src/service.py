@@ -14,6 +14,7 @@ from .backup_engine import BackupEngine
 from .mqtt_client import MQTTClient
 from .web_ui import create_app
 from .eject import eject_device
+from .gpio_manager import GPIOManager
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ class ServiceManager:
         self.unraid_client: Optional[UnraidClient] = None
         self.backup_engine: Optional[BackupEngine] = None
         self.mqtt_client: Optional[MQTTClient] = None
+        self.gpio: GPIOManager = GPIOManager() # Default pins
         self._running = False
         self._current_status = "idle"
         self._web_server: Optional[uvicorn.Server] = None
@@ -45,6 +47,10 @@ class ServiceManager:
         try:
             self._running = True
             logger.info("SnapSync service started successfully")
+            
+            # Initialize GPIO
+            await self.gpio.initialize()
+            await self.gpio.update_status("idle")
 
             # Setup logging level
             logging.getLogger().setLevel(getattr(logging, self.config.service.log_level))
@@ -153,6 +159,7 @@ class ServiceManager:
             logger.info("Service interruption detected.")
         except Exception as e:
             logger.error(f"Unexpected error in service loop: {e}", exc_info=True)
+            await self.gpio.update_status("failed")
         finally:
             logger.info("Service shutting down.")
             await self.stop()
@@ -164,6 +171,9 @@ class ServiceManager:
 
         logger.info("Stopping SnapSync service...")
         self._running = False
+        
+        # Cleanup GPIO
+        self.gpio.cleanup()
 
         # Stop SD card detector task
         if self.sd_detector:
@@ -262,6 +272,7 @@ class ServiceManager:
                 backup_id = f"pending_{sd_card.device_name}_{id(sd_card)}"
                 self._pending_backups[backup_id] = sd_card
                 self._current_status = "pending_approval"
+                await self.gpio.update_status("pending_approval")
 
                 logger.warning(f"⏸️  Backup pending approval for: {sd_card.device_name}")
                 logger.warning(f"  Approve via web UI (http://localhost:{self.config.service.web_ui_port})")
@@ -284,10 +295,12 @@ class ServiceManager:
                 await self.mqtt_client.publish_status("failed")
 
             self._current_status = "failed"
+            await self.gpio.update_status("failed")
 
     async def _start_backup(self, sd_card: SDCard):
         """Start backup for an SD card"""
         self._current_status = "backing_up"
+        await self.gpio.update_status("backing_up")
 
         if self.mqtt_client:
             await self.mqtt_client.publish_status("backing_up")
@@ -318,6 +331,7 @@ class ServiceManager:
                 status_msg = f"scanning ({count} files)"
             
             self._current_status = status_msg
+            await self.gpio.update_status("scanning")
             
             if self.mqtt_client:
                 await self.mqtt_client.publish_status(status_msg)
@@ -333,7 +347,10 @@ class ServiceManager:
         current_speed: float = 0
     ):
         """Handle backup progress updates"""
-        logger.info(f"Backup progress: {completed}/{total} files ({failed} failed)")
+        # Note: With new pipeline, this might be called for every file or batched
+        # If too frequent, we might want to rate limit logging here
+        
+        # logger.info(f"Backup progress: {completed}/{total} files ({failed} failed)")
 
         # Get session info
         session = await self.database.get_session(session_id)
@@ -344,6 +361,16 @@ class ServiceManager:
             "remaining_seconds": remaining_seconds,
             "current_speed": current_speed
         }
+        
+        # We need to make sure status stays "backing_up" in UI even if scanning finished
+        if not self._current_status.startswith("scanning"):
+            self._current_status = "backing_up"
+            # GPIO update handled by start_backup, but if we came from scanning...
+            # The engine updates DB status to 'backing_up' after scanning.
+            # We should probably listen to that? 
+            # Ideally the engine should have a status callback, but scanning_callback is for scanning.
+            # We can infer it here.
+            await self.gpio.update_status("backing_up")
 
         if self.mqtt_client:
             await self.mqtt_client.publish_progress(
@@ -357,10 +384,11 @@ class ServiceManager:
             )
 
         # Check if backup is complete
-        if completed + failed >= total:
+        if completed + failed >= total and total > 0:
             logger.info(f"Backup session {session_id} completed")
 
             self._current_status = "completed" if failed == 0 else "completed_with_errors"
+            await self.gpio.update_status(self._current_status)
 
             if self.mqtt_client:
                 await self.mqtt_client.publish_session_complete(session or {})
@@ -375,6 +403,7 @@ class ServiceManager:
             await asyncio.sleep(5)
             self._current_status = "idle"
             self._current_progress = {}
+            await self.gpio.update_status("idle")
 
             if self.mqtt_client:
                 await self.mqtt_client.publish_status("idle")
@@ -420,6 +449,7 @@ class ServiceManager:
             await self.mqtt_client.publish_status("idle")
 
         self._current_status = "idle"
+        await self.gpio.update_status("idle")
         return True
 
     async def set_auto_backup(self, enabled: bool):

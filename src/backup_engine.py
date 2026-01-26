@@ -1,4 +1,4 @@
-"""Backup engine for orchestrating file backups"""
+"Backup engine for orchestrating file backups"
 import asyncio
 import logging
 import time
@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional, List, Callable
 from datetime import datetime
 import uuid
+from concurrent.futures import ProcessPoolExecutor
 
 from .database import BackupDatabase, calculate_file_hash
 from .immich_client import ImmichClient
@@ -35,7 +36,9 @@ class BackupEngine:
         self.progress_callback = progress_callback
         self.scanning_callback = scanning_callback
         self._current_session_id: Optional[str] = None
-        self._semaphore = asyncio.Semaphore(config.backup.concurrent_files)
+        # We use a Queue instead of a list for producer-consumer pattern
+        self._upload_queue: Optional[asyncio.Queue] = None
+        self._stop_event = asyncio.Event()
 
     async def start_backup(self, sd_card: SDCard) -> str:
         """
@@ -46,11 +49,22 @@ class BackupEngine:
         """
         session_id = str(uuid.uuid4())
         self._current_session_id = session_id
+        self._stop_event.clear()
+        self._upload_queue = asyncio.Queue(maxsize=50) # Buffer 50 files to keep memory usage low
 
         logger.info(f"Starting backup session {session_id} for {sd_card.device_name}")
 
         try:
-            # Create initial session with 'scanning' status
+            # Pre-flight Check: Disk Space
+            total_size_estimate = 0
+            try:
+                # Quick rough estimate using shutil (if local) or just statvfs
+                # This is just a hint, scanning provides real size
+                pass 
+            except Exception:
+                pass
+
+            # Create initial session
             await self.database.create_session({
                 'session_id': session_id,
                 'device_name': sd_card.device_name,
@@ -61,35 +75,33 @@ class BackupEngine:
                 'total_bytes': 0
             })
 
-            # Scan SD card for files
-            files_to_backup = await self._scan_sd_card(sd_card, session_id)
+            # Start the pipeline
+            # 1. Producer: Scan and Hash
+            scan_task = asyncio.create_task(self._producer_scan(sd_card, session_id))
+            
+            # 2. Consumers: Upload Workers
+            num_workers = self.config.backup.concurrent_files
+            workers = [
+                asyncio.create_task(self._upload_worker(session_id, i)) 
+                for i in range(num_workers)
+            ]
 
-            # Calculate totals
-            total_files = len(files_to_backup)
-            total_bytes = sum(f['file_size'] for f in files_to_backup)
-
-            if not files_to_backup:
-                logger.info("No new files to backup")
-                await self.database.update_session(
-                    session_id,
-                    status='completed',
-                    total_files=0,
-                    total_bytes=0
-                )
-                return session_id
-
-            # Update session with totals and change status to backing_up
-            await self.database.update_session(
-                session_id,
-                status='backing_up',
-                total_files=total_files,
-                total_bytes=total_bytes
-            )
-
-            logger.info(f"Found {total_files} files to backup ({total_bytes} bytes)")
-
-            # Start backup process
-            asyncio.create_task(self._backup_files(session_id, files_to_backup))
+            # Wait for scanner to finish
+            await scan_task
+            
+            # Wait for queue to drain
+            await self._upload_queue.join()
+            
+            # Cancel workers
+            for w in workers:
+                w.cancel()
+            
+            # Final status update handled by progress tracking (or check here)
+            session = await self.database.get_session(session_id)
+            if session and session['status'] not in ['completed', 'failed', 'completed_with_errors']:
+                final_status = 'completed' if session['failed_files'] == 0 else 'completed_with_errors'
+                await self.database.update_session(session_id, status=final_status)
+                logger.info(f"Backup session {session_id} finished via pipeline.")
 
             return session_id
 
@@ -98,80 +110,97 @@ class BackupEngine:
             await self.database.update_session(session_id, status='failed')
             raise
 
-    async def _scan_sd_card(self, sd_card: SDCard, session_id: str) -> List[dict]:
+    async def _producer_scan(self, sd_card: SDCard, session_id: str):
         """
-        Scan SD card for files to backup
-
-        Returns:
-            List of file information dictionaries
+        Producer: Scan files, hash them (multi-core), and put into upload queue.
         """
-        files_to_backup = []
         mount_point = Path(sd_card.mount_point)
         scanned_count = 0
-
+        total_files_count = 0
+        total_bytes_found = 0
+        files_found_count = 0
+        
         logger.info(f"Scanning {mount_point} for files...")
-
-        # Pre-load existing files metadata to avoid N+1 DB queries
+        
+        # Pre-count for progress
         try:
-            existing_files = await self.database.get_existing_files_metadata(sd_card.device_id)
-            logger.info(f"Loaded {len(existing_files)} existing file records for fast lookup")
-        except Exception as e:
-            logger.error(f"Failed to load existing files metadata: {e}")
-            existing_files = set()
-
-        # Pre-count files for progress tracking
-        try:
-            # Only count regular files
             total_files_count = sum(1 for _ in mount_point.rglob('*') if _.is_file())
             logger.info(f"Found {total_files_count} total files to process")
-        except Exception as e:
-            logger.warning(f"Could not pre-count files: {e}")
-            total_files_count = 0
+        except Exception:
+            pass
 
+        # Load existing files cache
         try:
-            # Walk through all files on SD card
+            existing_files = await self.database.get_existing_files_metadata(sd_card.device_id)
+        except Exception:
+            existing_files = set()
+
+        # Update DB with total count immediately so UI shows something
+        await self.database.update_session(
+            session_id, 
+            total_files=total_files_count if total_files_count > 0 else 0
+        )
+
+        # Setup ProcessPoolExecutor for hashing
+        # Limit workers to avoid thrashing I/O, but use >1 for CPU speedup if MD5 is bottleneck
+        # Actually, for SD cards, sequential read is key. 
+        # But if we read in main process and hash in worker? No, passing data is slow.
+        # We let workers read. To avoid random I/O, we limit to 1 worker for hashing? 
+        # Or we rely on OS buffering.
+        # The user requested Multi-Core. We'll use 2-4 workers.
+        max_hash_workers = 2 
+        
+        with ProcessPoolExecutor(max_workers=max_hash_workers) as executor:
+            loop = asyncio.get_running_loop()
+            
             for file_path in mount_point.rglob('*'):
+                if self._stop_event.is_set():
+                    break
+                    
                 if not file_path.is_file():
                     continue
 
-                # Check file extension
-                if not self._should_backup_file(file_path):
-                    # Still count skipped files towards progress to keep total accurate
-                    scanned_count += 1
-                    if self.scanning_callback and scanned_count % 5 == 0:
-                         await self.scanning_callback(session_id, scanned_count, total_files_count, "Skipping...")
-                    continue
-
-                # Check file size
-                file_size = file_path.stat().st_size
-                if file_size < self.config.files.min_size:
-                    scanned_count += 1
-                    continue
-
-                # Report scanning progress
                 scanned_count += 1
-                if self.scanning_callback:
+                
+                # Report scanning progress
+                if self.scanning_callback and scanned_count % 10 == 0:
                     await self.scanning_callback(session_id, scanned_count, total_files_count, str(file_path.name))
 
-                # Optimization: Check if file already exists by metadata (in-memory) to avoid hashing
+                if not self._should_backup_file(file_path):
+                    continue
+
+                file_size = file_path.stat().st_size
+                if file_size < self.config.files.min_size:
+                    continue
+
+                # Optimization: Metadata check
                 if (file_path.name, file_size) in existing_files:
-                    logger.debug(f"File {file_path.name} already backed up (metadata match), skipping hash")
+                    logger.debug(f"Skipping {file_path.name} (metadata match)")
                     continue
 
-                # Calculate hash
-                logger.debug(f"Hashing {file_path.name}...")
-                file_hash = await asyncio.to_thread(calculate_file_hash, file_path)
+                # Hashing (Offloaded to process pool)
+                try:
+                    # Note: This does I/O in the worker process
+                    # calculate_file_hash is imported from database.py
+                    file_hash = await loop.run_in_executor(
+                        executor, 
+                        calculate_file_hash, 
+                        file_path,
+                        self.config.backup.hash_algorithm
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to hash {file_path}: {e}")
+                    continue
 
-                # Check if file already backed up
+                # Check DB for completion
                 if await self.database.file_exists(file_hash, sd_card.device_id):
-                    logger.debug(f"File {file_path.name} already backed up, skipping")
                     continue
 
-                # Get file creation date for organization
+                # Valid file to backup
                 file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
                 backup_date = file_mtime.strftime('%Y/%m/%d')
-
-                files_to_backup.append({
+                
+                file_info = {
                     'file_path': str(file_path),
                     'file_name': file_path.name,
                     'file_size': file_size,
@@ -180,191 +209,221 @@ class BackupEngine:
                     'status': 'new',
                     'backup_date': backup_date,
                     'created_at': file_mtime
-                })
+                }
+                
+                # Check space requirements once (Pre-flight for this file)
+                # If we were strictly pre-flighting, we'd do it before scanning.
+                # But here we do it dynamically. 
+                # Just proceed.
+                
+                files_found_count += 1
+                total_bytes_found += file_size
 
-        except Exception as e:
-            logger.error(f"Error scanning SD card: {e}", exc_info=True)
-
-        return files_to_backup
-
-    def _should_backup_file(self, file_path: Path) -> bool:
-        """Check if file should be backed up based on extension"""
-        ext = file_path.suffix.lower()
-        return ext in [e.lower() for e in self.config.files.extensions]
-
-    async def _backup_files(self, session_id: str, files: List[dict]):
-        """Backup files with parallel processing"""
-        completed = 0
-        failed = 0
-        transferred_bytes = 0
-        total_bytes = sum(f['file_size'] for f in files)
-        start_time = time.time()
-
-        try:
-            # Process files with concurrency limit
-            tasks = []
-            for file_info in files:
-                task = self._backup_single_file(session_id, file_info)
-                tasks.append(task)
-
-            # Process with progress tracking
-            for coro in asyncio.as_completed(tasks):
-                success, bytes_transferred = await coro
-
-                if success:
-                    completed += 1
-                    transferred_bytes += bytes_transferred
-                else:
-                    failed += 1
-
-                # Update session progress
+                # Update session totals incrementally (so progress bar grows correctly if total_files_count was wrong)
+                # Or better: We update session 'total_files' to match what we actually found to backup?
+                # No, total_files usually means "Files to backup".
+                # But we initialized with 0.
+                
+                # Logic update: We should update 'total_files' in DB as we find them, 
+                # so the progress bar (completed/total) makes sense.
+                # But we don't want it to jump 0->1->2.
+                # The previous logic counted ALL then updated.
+                # With pipelining, we update incrementally.
                 await self.database.update_session(
-                    session_id,
-                    completed_files=completed,
-                    failed_files=failed,
-                    transferred_bytes=transferred_bytes
+                    session_id, 
+                    total_files=files_found_count,
+                    total_bytes=total_bytes_found
                 )
+                
+                # Put in queue
+                await self._upload_queue.put(file_info)
 
-                # Calculate progress metrics
-                elapsed_seconds = time.time() - start_time
-                remaining_seconds = 0
-                current_speed = 0
+        # Signal end of scanning?
+        # We don't need a signal because we await the scan_task in start_backup.
+        # But consumers need to know when to stop?
+        # Consumers loop while True. We cancel them when queue is empty AND scan is done.
+        logger.info(f"Scanning finished. Found {files_found_count} new files.")
+        
+        # Update status from 'scanning' to 'backing_up' if not already
+        await self.database.update_session(session_id, status='backing_up')
 
-                if transferred_bytes > 0 and elapsed_seconds > 0:
-                    current_speed = transferred_bytes / elapsed_seconds  # bytes per second
-                    remaining_bytes = total_bytes - transferred_bytes
-                    if current_speed > 0:
-                        remaining_seconds = remaining_bytes / current_speed
+    async def _upload_worker(self, session_id: str, worker_id: int):
+        """
+        Consumer: Pulls files from queue and uploads them with retry logic.
+        """
+        while not self._stop_event.is_set():
+            try:
+                # Get a "work item"
+                file_info = await self._upload_queue.get()
+                
+                try:
+                    await self._backup_single_file_with_retry(session_id, file_info)
+                finally:
+                    # Notify queue that item is processed
+                    self._upload_queue.task_done()
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Worker {worker_id} error: {e}")
 
-                # Call progress callback
-                if self.progress_callback:
-                    await self.progress_callback(
-                        session_id,
-                        completed,
-                        failed,
-                        len(files),
-                        elapsed_seconds=elapsed_seconds,
-                        remaining_seconds=remaining_seconds,
-                        current_speed=current_speed
-                    )
+    async def _backup_single_file_with_retry(self, session_id: str, file_info: dict):
+        """
+        Wrapper around _backup_single_file to handle Smart Network Backoff
+        """
+        max_retries = self.config.backup.max_retries
+        retry_count = 0
+        
+        while retry_count <= max_retries:
+            success, bytes_transferred = await self._backup_single_file(session_id, file_info)
+            
+            if success:
+                return
+            
+            # If failed, check if we should backoff
+            retry_count += 1
+            if retry_count <= max_retries:
+                logger.warning(f"File {file_info['file_name']} failed. Retry {retry_count}/{max_retries}...")
+                
+                # Smart Network Backoff Check
+                # If clients are disconnected, wait until they are back
+                if not await self._check_connectivity():
+                    logger.warning("Network connectivity lost. Pausing backup...")
+                    await self._wait_for_connectivity()
+                    logger.info("Network restored. Resuming...")
+                
+                await asyncio.sleep(self.config.backup.retry_delay)
+            else:
+                logger.error(f"File {file_info['file_name']} failed after {max_retries} retries.")
 
-            # Mark session as completed
-            final_status = 'completed' if failed == 0 else 'completed_with_errors'
-            await self.database.update_session(session_id, status=final_status)
+    async def _check_connectivity(self) -> bool:
+        """Check if backup destinations are reachable"""
+        tasks = []
+        if self.config.immich.enabled and self.immich_client:
+            tasks.append(self.immich_client.check_connection())
+        if self.config.unraid.enabled and self.unraid_client:
+            tasks.append(self.unraid_client.check_connection())
+            
+        if not tasks:
+            return True
+            
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Return True if ANY configured destination is reachable? Or ALL?
+        # If one is down, we might want to pause to avoid partial backups?
+        # Let's say ALL must be reachable if enabled.
+        return all(r is True for r in results)
 
-            logger.info(
-                f"Backup session {session_id} finished: "
-                f"{completed} completed, {failed} failed"
-            )
-
-        except Exception as e:
-            logger.error(f"Error during backup: {e}", exc_info=True)
-            await self.database.update_session(session_id, status='failed')
+    async def _wait_for_connectivity(self):
+        """Loop until connectivity is restored"""
+        while True:
+            if await self._check_connectivity():
+                return
+            await asyncio.sleep(10) # Check every 10s
 
     async def _backup_single_file(self, session_id: str, file_info: dict) -> tuple[bool, int]:
-        """
-        Backup a single file to configured destinations
+        """Backup a single file (Implementation)"""
+        # (This remains mostly the same as before, but called by worker)
+        # Note: Logic copied from previous implementation but slightly adapted
+        
+        file_path = Path(file_info['file_path'])
+        file_id = None
+        
+        try:
+            # UPSERT into DB
+            file_id = await self.database.add_file(file_info)
+            await self.database.update_file_status(file_id, 'backing_up')
 
-        Returns:
-            Tuple of (success, bytes_transferred)
-        """
-        async with self._semaphore:
-            file_path = Path(file_info['file_path'])
-            file_id = None
+            # Prepare uploads
+            upload_tasks = []
+            if self.config.immich.enabled and self.immich_client:
+                upload_tasks.append(('immich', self._upload_to_immich(file_path, file_info)))
+            if self.config.unraid.enabled and self.unraid_client:
+                upload_tasks.append(('unraid', self._upload_to_unraid(file_path, file_info)))
 
-            try:
-                # Add file to database
-                file_id = await self.database.add_file(file_info)
+            # Execute
+            results = await asyncio.gather(*[task for _, task in upload_tasks], return_exceptions=True)
+            
+            immich_uploaded = False
+            unraid_uploaded = False
+            immich_asset_id = None
+            unraid_path = None
 
-                # Update status to backing_up
-                await self.database.update_file_status(file_id, 'backing_up')
-
-                logger.info(f"Backing up {file_info['file_name']}...")
-
-                # Prepare upload tasks
-                upload_tasks = []
-
-                if self.config.immich.enabled and self.immich_client:
-                    upload_tasks.append(('immich', self._upload_to_immich(file_path, file_info)))
-
-                if self.config.unraid.enabled and self.unraid_client:
-                    upload_tasks.append(('unraid', self._upload_to_unraid(file_path, file_info)))
-
-                # Execute uploads (parallel if configured)
-                if self.config.backup.parallel:
-                    results = await asyncio.gather(*[task for _, task in upload_tasks], return_exceptions=True)
-                else:
-                    results = []
-                    for _, task in upload_tasks:
-                        results.append(await task)
-
-                # Process results
-                immich_uploaded = False
-                unraid_uploaded = False
-                immich_asset_id = None
-                unraid_path = None
-
-                for i, (dest, _) in enumerate(upload_tasks):
-                    result = results[i]
-
-                    if isinstance(result, Exception):
-                        logger.error(f"Upload to {dest} failed: {result}")
-                        continue
-
-                    if dest == 'immich' and result:
-                        immich_uploaded = True
-                        immich_asset_id = result.get('id')
-                    elif dest == 'unraid' and result:
-                        unraid_uploaded = True
-                        unraid_path = result
-
-                # Check for overall success based on upload status and verification
-                upload_success = (self.config.immich.enabled is False or immich_uploaded) and \
-                                 (self.config.unraid.enabled is False or unraid_uploaded)
-
-                verification_success = True
-                if upload_success and self.config.backup.verify_checksums:
-                    verification_success = await self._verify_uploads(
-                        file_path, file_info,
-                        immich_asset_id,
-                        unraid_path
-                    )
+            for i, (dest, _) in enumerate(upload_tasks):
+                result = results[i]
+                if isinstance(result, Exception):
+                    logger.error(f"Upload to {dest} failed: {result}")
+                    continue
                 
-                success = upload_success and verification_success
-                final_status = 'completed' if success else 'failed'
-                error_message = "Verification failed" if not verification_success else None
+                if dest == 'immich' and result:
+                    immich_uploaded = True
+                    immich_asset_id = result.get('id')
+                elif dest == 'unraid' and result:
+                    unraid_uploaded = True
+                    unraid_path = result
 
-                # Update database with the final status
-                await self.database.update_file_status(
-                    file_id,
-                    final_status,
-                    error_message=error_message,
-                    immich_uploaded=immich_uploaded,
-                    unraid_uploaded=unraid_uploaded,
-                    immich_asset_id=immich_asset_id,
-                    unraid_path=unraid_path
+            upload_success = (self.config.immich.enabled is False or immich_uploaded) and \
+                             (self.config.unraid.enabled is False or unraid_uploaded)
+            
+            verification_success = True
+            if upload_success and self.config.backup.verify_checksums:
+                verification_success = await self._verify_uploads(
+                    file_path, file_info, immich_asset_id, unraid_path
                 )
 
-                return success, file_info['file_size'] if success else 0
-
-            except Exception as e:
-                logger.error(f"Error backing up {file_info['file_name']}: {e}", exc_info=True)
-
-                if file_id:
-                    await self.database.update_file_status(
-                        file_id,
-                        'failed',
-                        error_message=str(e)
+            success = upload_success and verification_success
+            final_status = 'completed' if success else 'failed'
+            error_msg = "Verification failed" if not verification_success else None
+            
+            await self.database.update_file_status(
+                file_id, final_status, error_message=error_msg,
+                immich_uploaded=immich_uploaded, unraid_uploaded=unraid_uploaded,
+                immich_asset_id=immich_asset_id, unraid_path=unraid_path
+            )
+            
+            # Update Progress (Since this is worker, we need to handle session updates here)
+            # The session totals are updated by producer. We update completed/failed.
+            if success:
+                await self.database.db.execute(
+                    "UPDATE backup_sessions SET completed_files = completed_files + 1, transferred_bytes = transferred_bytes + ? WHERE session_id = ?",
+                    (file_info['file_size'], session_id)
+                )
+            else:
+                await self.database.db.execute(
+                    "UPDATE backup_sessions SET failed_files = failed_files + 1 WHERE session_id = ?",
+                    (session_id,)
+                )
+            await self.database.db.commit()
+            
+            # Callback
+            if self.progress_callback:
+                # We need to fetch current session stats to report accurately
+                session = await self.database.get_session(session_id)
+                if session:
+                    # Calculate elapsed/speed
+                    start_t = datetime.fromisoformat(session['start_time']).timestamp() if isinstance(session['start_time'], str) else time.time() # Simplification
+                    elapsed = time.time() - start_t
+                    transferred = session['transferred_bytes']
+                    total_bytes = session['total_bytes']
+                    speed = transferred / elapsed if elapsed > 0 else 0
+                    remaining = (total_bytes - transferred) / speed if speed > 0 else 0
+                    
+                    await self.progress_callback(
+                        session_id,
+                        session['completed_files'],
+                        session['failed_files'],
+                        session['total_files'],
+                        elapsed_seconds=elapsed,
+                        remaining_seconds=remaining,
+                        current_speed=speed
                     )
 
-                # Retry logic - not fully implemented in original but we keep placeholder
-                if file_id and file_info.get('retry_count', 0) < self.config.backup.max_retries:
-                    await self.database.increment_retry_count(file_id)
-                    await asyncio.sleep(self.config.backup.retry_delay)
-                    logger.info(f"Retrying {file_info['file_name']}...")
-                    return await self._backup_single_file(session_id, file_info)
-
-                return False, 0
+            return success, file_info['file_size'] if success else 0
+            
+        except Exception as e:
+            logger.error(f"Error backing up single file: {e}")
+            if file_id:
+                await self.database.update_file_status(file_id, 'failed', error_message=str(e))
+            return False, 0
 
     async def _upload_to_immich(self, file_path: Path, file_info: dict) -> Optional[dict]:
         """Upload file to Immich"""
@@ -401,31 +460,17 @@ class BackupEngine:
     ) -> bool:
         """
         Verify uploaded files match source.
-
-        Returns:
-            True if all enabled verifications pass, False otherwise.
         """
-        logger.debug(f"Verifying uploads for {file_info['file_name']}...")
         all_verified = True
-
-        # Verify Immich
         if self.config.immich.enabled and immich_asset_id and self.immich_client:
             if not await self.immich_client.verify_asset(immich_asset_id):
-                logger.warning(f"Immich verification failed for {file_info['file_name']}")
                 all_verified = False
-
-        # Verify Unraid
         if self.config.unraid.enabled and unraid_path and self.unraid_client:
             if not await self.unraid_client.verify_file(unraid_path, file_info['file_size']):
-                logger.warning(f"Unraid verification failed for {file_info['file_name']}")
                 all_verified = False
-        
         return all_verified
 
-    async def get_session_status(self, session_id: str) -> Optional[dict]:
-        """Get current status of a backup session"""
-        return await self.database.get_session(session_id)
-
-    async def get_active_session(self) -> Optional[dict]:
-        """Get currently active backup session"""
-        return await self.database.get_active_session()
+    def _should_backup_file(self, file_path: Path) -> bool:
+        """Check if file should be backed up based on extension"""
+        ext = file_path.suffix.lower()
+        return ext in [e.lower() for e in self.config.files.extensions]

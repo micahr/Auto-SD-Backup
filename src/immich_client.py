@@ -156,6 +156,12 @@ class ImmichClient:
             logger.error(f"Error verifying asset {asset_id}: {e}")
             return False
 
+    async def check_space(self, required_bytes: int) -> bool:
+        """Check if server has enough space (Placeholder implementation)"""
+        # Immich API doesn't standardly expose free space to non-admins easily.
+        # Assuming true for now.
+        return True
+
     async def get_asset_info(self, asset_id: str) -> Optional[Dict[str, Any]]:
         """Get information about an asset"""
         try:

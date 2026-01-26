@@ -20,6 +20,10 @@ class BackupDatabase:
         """Initialize database connection and create tables"""
         self.db = await aiosqlite.connect(self.db_path)
         self.db.row_factory = aiosqlite.Row
+        
+        # Enable Write-Ahead Logging for better concurrency
+        await self.db.execute("PRAGMA journal_mode=WAL")
+        
         await self._create_tables()
         await self._migrate_schema()  # Ensure schema is up-to-date
         logger.info(f"Database initialized at {self.db_path}")
@@ -336,10 +340,20 @@ class BackupDatabase:
         logger.info("Database has been reset.")
 
 
-def calculate_file_hash(file_path: Path, chunk_size: int = 1024 * 1024) -> str:
-    """Calculate MD5 hash of a file"""
-    md5 = hashlib.md5()
+def calculate_file_hash(file_path: Path, algorithm: str = 'md5', chunk_size: int = 1024 * 1024) -> str:
+    """Calculate hash of a file using MD5 or xxHash"""
+    if algorithm == 'xxhash':
+        try:
+            import xxhash
+            hasher = xxhash.xxh64()
+        except ImportError:
+            # Fallback if not installed (though it should be)
+            logging.getLogger(__name__).warning("xxhash not found, falling back to md5")
+            hasher = hashlib.md5()
+    else:
+        hasher = hashlib.md5()
+        
     with open(file_path, 'rb') as f:
         while chunk := f.read(chunk_size):
-            md5.update(chunk)
-    return md5.hexdigest()
+            hasher.update(chunk)
+    return hasher.hexdigest()
