@@ -153,90 +153,91 @@ class BackupEngine:
         with ProcessPoolExecutor(max_workers=max_hash_workers) as executor:
             loop = asyncio.get_running_loop()
             
-            for file_path in mount_point.rglob('*'):
-                if self._stop_event.is_set():
-                    break
+            try:
+                for file_path in mount_point.rglob('*'):
+                    if self._stop_event.is_set():
+                        break
                     
-                if not file_path.is_file():
-                    continue
+                    try:
+                        if not file_path.is_file():
+                            continue
+                    except OSError:
+                        # Handle case where file disappears during iteration
+                        continue
 
-                scanned_count += 1
-                
-                # Report scanning progress
-                if self.scanning_callback and scanned_count % 10 == 0:
-                    await self.scanning_callback(session_id, scanned_count, total_files_count, str(file_path.name))
+                    scanned_count += 1
+                    
+                    # Report scanning progress
+                    if self.scanning_callback and scanned_count % 10 == 0:
+                        await self.scanning_callback(session_id, scanned_count, total_files_count, str(file_path.name))
 
-                if not self._should_backup_file(file_path):
-                    continue
+                    if not self._should_backup_file(file_path):
+                        continue
 
-                file_size = file_path.stat().st_size
-                if file_size < self.config.files.min_size:
-                    continue
+                    try:
+                        file_size = file_path.stat().st_size
+                    except OSError:
+                        continue
+                        
+                    if file_size < self.config.files.min_size:
+                        continue
 
-                # Optimization: Metadata check
-                if (file_path.name, file_size) in existing_files:
-                    logger.debug(f"Skipping {file_path.name} (metadata match)")
-                    continue
+                    # Optimization: Metadata check
+                    if (file_path.name, file_size) in existing_files:
+                        logger.debug(f"Skipping {file_path.name} (metadata match)")
+                        continue
 
-                # Hashing (Offloaded to process pool)
-                try:
-                    # Note: This does I/O in the worker process
-                    # calculate_file_hash is imported from database.py
-                    file_hash = await loop.run_in_executor(
-                        executor, 
-                        calculate_file_hash, 
-                        file_path,
-                        self.config.backup.hash_algorithm
+                    # Hashing (Offloaded to process pool)
+                    try:
+                        # Note: This does I/O in the worker process
+                        # calculate_file_hash is imported from database.py
+                        file_hash = await loop.run_in_executor(
+                            executor, 
+                            calculate_file_hash, 
+                            file_path,
+                            self.config.backup.hash_algorithm
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to hash {file_path}: {e}")
+                        continue
+
+                    # Check DB for completion
+                    if await self.database.file_exists(file_hash, sd_card.device_id):
+                        continue
+
+                    # Valid file to backup
+                    try:
+                        file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
+                    except OSError:
+                        continue
+                        
+                    backup_date = file_mtime.strftime('%Y/%m/%d')
+                    
+                    file_info = {
+                        'file_path': str(file_path),
+                        'file_name': file_path.name,
+                        'file_size': file_size,
+                        'md5_hash': file_hash,
+                        'source_device': sd_card.device_id,
+                        'status': 'new',
+                        'backup_date': backup_date,
+                        'created_at': file_mtime
+                    }
+                    
+                    files_found_count += 1
+                    total_bytes_found += file_size
+
+                    await self.database.update_session(
+                        session_id, 
+                        total_files=files_found_count,
+                        total_bytes=total_bytes_found
                     )
-                except Exception as e:
-                    logger.error(f"Failed to hash {file_path}: {e}")
-                    continue
-
-                # Check DB for completion
-                if await self.database.file_exists(file_hash, sd_card.device_id):
-                    continue
-
-                # Valid file to backup
-                file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
-                backup_date = file_mtime.strftime('%Y/%m/%d')
-                
-                file_info = {
-                    'file_path': str(file_path),
-                    'file_name': file_path.name,
-                    'file_size': file_size,
-                    'md5_hash': file_hash,
-                    'source_device': sd_card.device_id,
-                    'status': 'new',
-                    'backup_date': backup_date,
-                    'created_at': file_mtime
-                }
-                
-                # Check space requirements once (Pre-flight for this file)
-                # If we were strictly pre-flighting, we'd do it before scanning.
-                # But here we do it dynamically. 
-                # Just proceed.
-                
-                files_found_count += 1
-                total_bytes_found += file_size
-
-                # Update session totals incrementally (so progress bar grows correctly if total_files_count was wrong)
-                # Or better: We update session 'total_files' to match what we actually found to backup?
-                # No, total_files usually means "Files to backup".
-                # But we initialized with 0.
-                
-                # Logic update: We should update 'total_files' in DB as we find them, 
-                # so the progress bar (completed/total) makes sense.
-                # But we don't want it to jump 0->1->2.
-                # The previous logic counted ALL then updated.
-                # With pipelining, we update incrementally.
-                await self.database.update_session(
-                    session_id, 
-                    total_files=files_found_count,
-                    total_bytes=total_bytes_found
-                )
-                
-                # Put in queue
-                await self._upload_queue.put(file_info)
+                    
+                    # Put in queue
+                    await self._upload_queue.put(file_info)
+            except OSError as e:
+                logger.warning(f"Error traversing directory structure: {e}")
+                # We continue to let the queue drain even if scan was partial
 
         # Signal end of scanning?
         # We don't need a signal because we await the scan_task in start_backup.
