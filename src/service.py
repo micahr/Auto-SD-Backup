@@ -305,10 +305,32 @@ class ServiceManager:
         if self.mqtt_client:
             await self.mqtt_client.publish_status("backing_up")
 
-        # Start backup
+        # start_backup awaits the full scan + upload pipeline before returning
         session_id = await self.backup_engine.start_backup(sd_card)
 
-        logger.info(f"Backup started with session ID: {session_id}")
+        logger.info(f"Backup completed with session ID: {session_id}")
+
+        # Completion handling — runs only after both scan and all uploads are done
+        session = await self.database.get_session(session_id)
+        failed = session.get('failed_files', 0) if session else 0
+        self._current_status = "completed" if failed == 0 else "completed_with_errors"
+        await self.gpio.update_status(self._current_status)
+
+        if self.mqtt_client:
+            await self.mqtt_client.publish_session_complete(session or {})
+
+        # Auto-eject only after the full pipeline (scan + uploads) is done
+        if self.config.backup.auto_eject and session and session.get('mount_point'):
+            logger.info(f"Auto-ejecting {session['mount_point']}...")
+            await eject_device(session['mount_point'])
+
+        await asyncio.sleep(5)
+        self._current_status = "idle"
+        self._current_progress = {}
+        await self.gpio.update_status("idle")
+
+        if self.mqtt_client:
+            await self.mqtt_client.publish_status("idle")
 
     async def _on_sd_card_removed(self, sd_card: SDCard):
         """Handle SD card removal event"""
@@ -382,31 +404,6 @@ class ServiceManager:
                 remaining_seconds=remaining_seconds,
                 current_speed=current_speed
             )
-
-        # Check if backup is complete
-        if completed + failed >= total and total > 0:
-            logger.info(f"Backup session {session_id} completed")
-
-            self._current_status = "completed" if failed == 0 else "completed_with_errors"
-            await self.gpio.update_status(self._current_status)
-
-            if self.mqtt_client:
-                await self.mqtt_client.publish_session_complete(session or {})
-                await self.mqtt_client.publish_status("completed")
-
-            # Auto-eject if enabled (regardless of success/failure)
-            if self.config.backup.auto_eject and session and session.get('mount_point'):
-                logger.info(f"Auto-ejecting {session['mount_point']}...")
-                await eject_device(session['mount_point'])
-
-            # Return to idle after a short delay
-            await asyncio.sleep(5)
-            self._current_status = "idle"
-            self._current_progress = {}
-            await self.gpio.update_status("idle")
-
-            if self.mqtt_client:
-                await self.mqtt_client.publish_status("idle")
 
     async def get_status(self) -> dict:
         """Get current service status"""

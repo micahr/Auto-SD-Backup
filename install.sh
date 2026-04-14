@@ -113,6 +113,12 @@ systemctl daemon-reload
 echo "Enabling service..."
 systemctl enable snapsync
 
+# Add user to disk group so the service can read raw block devices for ExFAT UUID extraction.
+# Without this, two cards with the same volume label (e.g. from the same camera) cannot be
+# distinguished and deduplication will incorrectly treat them as the same card.
+echo "Adding $INSTALL_USER to disk group (needed for ExFAT UUID extraction)..."
+usermod -aG disk "$INSTALL_USER"
+
 # Setup auto-mounting via udev
 echo ""
 echo "Setting up auto-mounting rules..."

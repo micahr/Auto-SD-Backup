@@ -118,17 +118,27 @@ class BackupDatabase:
         result = await cursor.fetchone()
         return result is not None
 
-    async def get_existing_files_metadata(self, source_device: str) -> set[tuple[str, int]]:
+    async def get_existing_files_metadata(self, source_device: str, mount_point: Optional[str] = None) -> set[tuple[str, int]]:
         """
-        Get a set of (file_name, file_size) tuples for all completed backups from a device.
-        Used for bulk checking to avoid N+1 queries.
+        Get a set of (relative_path, file_size) tuples for all completed backups from a device.
+        relative_path is the file path relative to mount_point (e.g. DCIM/100CANON/IMG_0001.JPG),
+        which correctly distinguishes files in different folders that share the same filename.
+        Falls back to bare filename if mount_point is not provided or doesn't match stored paths.
         """
         cursor = await self.db.execute(
-            "SELECT file_name, file_size FROM files WHERE source_device = ? AND status = 'completed'",
+            "SELECT file_path, file_name, file_size FROM files WHERE source_device = ? AND status = 'completed'",
             (source_device,)
         )
         rows = await cursor.fetchall()
-        return {(row['file_name'], row['file_size']) for row in rows}
+        result = set()
+        for row in rows:
+            stored_path = row['file_path']
+            if mount_point and stored_path.startswith(mount_point):
+                key = stored_path[len(mount_point):].lstrip('/')
+            else:
+                key = row['file_name']
+            result.add((key, row['file_size']))
+        return result
 
     async def add_file(self, file_info: Dict[str, Any]) -> int:
         """Add a new file to the database or update existing failed one"""

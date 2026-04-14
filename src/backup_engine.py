@@ -1,6 +1,7 @@
 "Backup engine for orchestrating file backups"
 import asyncio
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Optional, List, Callable
@@ -124,14 +125,17 @@ class BackupEngine:
         
         # Pre-count for progress
         try:
-            total_files_count = sum(1 for _ in mount_point.rglob('*') if _.is_file())
+            total_files_count = sum(
+                len(filenames)
+                for _, _, filenames in os.walk(str(mount_point), onerror=lambda e: None)
+            )
             logger.info(f"Found {total_files_count} total files to process")
         except Exception:
             pass
 
-        # Load existing files cache
+        # Load existing files cache (keyed on relative path + size, not bare filename)
         try:
-            existing_files = await self.database.get_existing_files_metadata(sd_card.device_id)
+            existing_files = await self.database.get_existing_files_metadata(sd_card.device_id, str(mount_point))
         except Exception:
             existing_files = set()
 
@@ -153,20 +157,19 @@ class BackupEngine:
         with ProcessPoolExecutor(max_workers=max_hash_workers) as executor:
             loop = asyncio.get_running_loop()
             
-            try:
-                for file_path in mount_point.rglob('*'):
+            for root, dirs, filenames in os.walk(
+                str(mount_point),
+                onerror=lambda e: logger.warning(f"Error traversing directory during scan: {e}")
+            ):
+                if self._stop_event.is_set():
+                    break
+                for filename in filenames:
+                    file_path = Path(root) / filename
                     if self._stop_event.is_set():
                         break
-                    
-                    try:
-                        if not file_path.is_file():
-                            continue
-                    except OSError:
-                        # Handle case where file disappears during iteration
-                        continue
 
                     scanned_count += 1
-                    
+
                     # Report scanning progress
                     if self.scanning_callback and scanned_count % 10 == 0:
                         await self.scanning_callback(session_id, scanned_count, total_files_count, str(file_path.name))
@@ -178,12 +181,15 @@ class BackupEngine:
                         file_size = file_path.stat().st_size
                     except OSError:
                         continue
-                        
+
                     if file_size < self.config.files.min_size:
                         continue
 
-                    # Optimization: Metadata check
-                    if (file_path.name, file_size) in existing_files:
+                    # Optimization: Metadata check using relative path to correctly
+                    # distinguish files in different folders with the same filename
+                    # (e.g. DCIM/100FUJI/DSCF0001.JPG vs DCIM/101FUJI/DSCF0001.JPG)
+                    relative_path = str(file_path.relative_to(mount_point))
+                    if (relative_path, file_size) in existing_files:
                         logger.debug(f"Skipping {file_path.name} (metadata match)")
                         continue
 
@@ -192,8 +198,8 @@ class BackupEngine:
                         # Note: This does I/O in the worker process
                         # calculate_file_hash is imported from database.py
                         file_hash = await loop.run_in_executor(
-                            executor, 
-                            calculate_file_hash, 
+                            executor,
+                            calculate_file_hash,
                             file_path,
                             self.config.backup.hash_algorithm
                         )
@@ -210,9 +216,9 @@ class BackupEngine:
                         file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
                     except OSError:
                         continue
-                        
+
                     backup_date = file_mtime.strftime('%Y/%m/%d')
-                    
+
                     file_info = {
                         'file_path': str(file_path),
                         'file_name': file_path.name,
@@ -223,21 +229,20 @@ class BackupEngine:
                         'backup_date': backup_date,
                         'created_at': file_mtime
                     }
-                    
+
                     files_found_count += 1
                     total_bytes_found += file_size
 
+                    # Only update bytes — total_files was set to the card's actual
+                    # file count at the start of the scan and should not be overwritten
+                    # with the running count of new files.
                     await self.database.update_session(
-                        session_id, 
-                        total_files=files_found_count,
+                        session_id,
                         total_bytes=total_bytes_found
                     )
-                    
+
                     # Put in queue
                     await self._upload_queue.put(file_info)
-            except OSError as e:
-                logger.warning(f"Error traversing directory structure: {e}")
-                # We continue to let the queue drain even if scan was partial
 
         # Signal end of scanning?
         # We don't need a signal because we await the scan_task in start_backup.

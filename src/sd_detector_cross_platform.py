@@ -2,6 +2,7 @@
 import logging
 import asyncio
 import platform
+import subprocess
 from pathlib import Path
 from typing import Optional, Callable, List
 from dataclasses import dataclass
@@ -128,18 +129,107 @@ class LinuxSDCardDetector:
         except:
             return 0
 
+    def _get_device_uuid(self, device) -> Optional[str]:
+        """
+        Get the filesystem UUID for a partition, trying three methods in order:
+
+        1. udev ID_FS_UUID property — fastest, no subprocess needed.
+        2. blkid subprocess — reads from the kernel/udev blkid cache.
+        3. Direct ExFAT boot sector read — works when udev/blkid don't support
+           ExFAT UUID extraction (common on older OrangePi kernels). Requires
+           the service user to be in the 'disk' group:
+               sudo usermod -aG disk <username>
+        """
+        # 1. udev property
+        uuid = device.get('ID_FS_UUID')
+        if uuid:
+            return uuid
+
+        # 2. blkid subprocess
+        try:
+            result = subprocess.run(
+                ['blkid', '-o', 'value', '-s', 'UUID', device.device_node],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                uuid = result.stdout.strip()
+                if uuid:
+                    logger.debug(f"Got UUID via blkid for {device.device_node}: {uuid}")
+                    return uuid
+        except Exception as e:
+            logger.debug(f"blkid unavailable for {device.device_node}: {e}")
+
+        # 3. Direct ExFAT boot sector read.
+        # ExFAT VolumeSerialNumber sits at byte offset 100 (0x64) in the boot
+        # sector and is the source of the XXXX-XXXX UUID that blkid normally
+        # reports.  We verify the "EXFAT   " signature at offset 3 first.
+        try:
+            with open(device.device_node, 'rb') as f:
+                f.seek(3)
+                if f.read(8) == b'EXFAT   ':
+                    f.seek(100)
+                    data = f.read(4)
+                    if len(data) == 4:
+                        serial = int.from_bytes(data, 'little')
+                        if serial == 0:
+                            logger.debug(f"ExFAT VolumeSerialNumber is zero for {device.device_node}, skipping")
+                        else:
+                            uuid = f'{serial >> 16:04X}-{serial & 0xFFFF:04X}'
+                            logger.debug(f"Got ExFAT UUID via boot sector for {device.device_node}: {uuid}")
+                            return uuid
+        except PermissionError:
+            logger.warning(
+                f"Cannot read {device.device_node} to extract ExFAT UUID — "
+                f"two cards with the same volume label will be treated as the "
+                f"same device until the service user is added to the disk group: "
+                f"  sudo usermod -aG disk <service-username>"
+            )
+        except Exception as e:
+            logger.debug(f"Boot sector UUID read failed for {device.device_node}: {e}")
+
+        return None
+
     async def _handle_device_event(self, device, action):
         """Handle device add/remove events"""
         try:
             logger.debug(f"Handling device event: action={action}, device={getattr(device, 'sys_name', 'unknown')}")
-            
-            if action == 'add':
+
+            if action in ('add', 'change'):
                 is_removable = self._check_removable(device)
                 logger.debug(f"Device {getattr(device, 'sys_name', 'unknown')} removable: {is_removable}")
-                
+
                 if is_removable:
+                    # A 'change' event on a whole-disk device (e.g. sdb) means media was
+                    # inserted into a permanently-connected card reader.  The mount point
+                    # lives on a partition (e.g. sdb1), so recurse into child partitions.
+                    if device.get('DEVTYPE') == 'disk':
+                        logger.debug(f"Disk device {device.sys_name} changed, scanning partitions...")
+                        # Small delay so the kernel has time to create partition entries
+                        await asyncio.sleep(1)
+                        for child in device.children:
+                            if child.get('DEVTYPE') == 'partition':
+                                await self._handle_device_event(child, 'add')
+                        return
+
+                    # If already tracked, verify it's still the same card by comparing
+                    # mount points. When a card is ejected via umount (not physically
+                    # removed), there is no udev 'remove' event, so _mounted_cards retains
+                    # the stale entry. A different (or absent) mount point means the card
+                    # was swapped — clear the stale entry and handle the new card.
+                    if device.sys_name in self._mounted_cards:
+                        stored_mount = self._mounted_cards[device.sys_name].mount_point
+                        current_mount = self._get_mount_point(device)
+                        if current_mount == stored_mount:
+                            logger.debug(f"Device {device.sys_name} already tracked, skipping")
+                            return
+                        logger.debug(f"Device {device.sys_name} stale entry cleared ({stored_mount} → {current_mount!r})")
+                        old_card = self._mounted_cards.pop(device.sys_name)
+                        if self.on_remove:
+                            await self.on_remove(old_card)
+                        # Fall through to handle the new card below
+
                     logger.debug("Waiting for mount...")
-                    
+
                     # Retry loop for slow auto-mounters
                     mount_point = None
                     for i in range(5):
@@ -150,15 +240,36 @@ class LinuxSDCardDetector:
                         logger.debug(f"Retry {i+1}/5: Waiting for mount point...")
 
                     logger.debug(f"Mount point for {getattr(device, 'device_node', 'unknown')}: {mount_point}")
-                    
+
                     if mount_point:
+                        device_id = self._get_device_uuid(device)
+                        if not device_id:
+                            # UUID unavailable — compose from reader serial + volume label.
+                            # The mount point basename is the ExFAT volume label as reported
+                            # by systemd-mount, even when udev doesn't expose ID_FS_LABEL.
+                            reader_serial = device.get('ID_SERIAL') or device.sys_name
+                            fs_label = device.get('ID_FS_LABEL') or Path(mount_point).name
+                            if fs_label:
+                                device_id = f"{reader_serial}:{fs_label}"
+                                logger.warning(
+                                    f"No unique filesystem UUID for {device.device_node}. "
+                                    f"Using serial+label as device ID ({device_id!r}). "
+                                    f"Cards with identical labels will be treated as the same device."
+                                )
+                            else:
+                                device_id = reader_serial
+                                logger.warning(
+                                    f"No unique filesystem UUID or label for {device.device_node}. "
+                                    f"All cards in this reader share device ID ({device_id!r})."
+                                )
+                        logger.debug(f"Device {device.sys_name} device_id={device_id!r}")
                         sd_card = SDCard(
                             device_name=device.sys_name,
                             mount_point=mount_point,
                             device_path=device.device_node,
                             size=self._get_device_size(device),
                             label=self._get_device_label(device),
-                            device_id=device.get('ID_FS_UUID') or device.get('ID_SERIAL') or device.sys_name
+                            device_id=device_id
                         )
                         self._mounted_cards[device.sys_name] = sd_card
                         logger.info(f"SD card detected: {sd_card.device_name} at {sd_card.mount_point}")
